@@ -1,0 +1,3657 @@
+;; Clojure core.clj:
+;   Copyright (c) Rich Hickey. All rights reserved.
+;   The use and distribution terms for this software are covered by the
+;   Eclipse Public License 1.0 (http://opensource.org/licenses/eclipse-1.0.php)
+;   which can be found in the file epl-v10.html at the root of this distribution.
+;   By using this software in any fashion, you are agreeing to be bound by
+;   the terms of this license.
+;   You must not remove this notice, or any other, from this software.
+
+;; Adaptations for Pajaro: Copyright (c) 2026 by Phill Wolf
+
+(gen-class :name "clojure.core" :ext "pm")
+
+;; This file picks up where Pajaro.pm left off: the clojure.core
+;; namespace is pulling itself up by its bootstraps.  For example:
+;; there is no (let ...) or (fn ...) yet. Nor will there be macros
+;; until (macroexpand ...) works...
+
+(def second (fn* [coll] (first (rest coll))))
+
+(def ffirst (fn* [coll] (first (first coll))))
+
+(def nfirst (fn* [coll] (next (first coll))))
+
+(def fnext (fn* [coll] (first (next coll))))
+
+(def nnext (fn* [coll] (next (next coll))))
+
+;; Macro expansion:
+
+;; A new seq containing the items prepended to the rest, the last of which will be treated as a sequence.
+(def list*
+  (fn* list*
+       [& args]
+       (if (= 1 (count args))
+         (seq (first args))
+         (if (= 2 (count args))
+           (cons (first args) (first (rest args)))
+           (cons (first args) (apply list* (rest args)))))))
+
+(def macroexpand-1
+  (fn* [x]
+       (if (seq? x)
+         (let* [func-term (first x)]
+           (if (symbol? func-term)
+	     ;; (.-foo thing) => (. thing -foo)
+             (let* [func-term-name (name func-term)
+                    dot-something (if (= "." func-term-name)
+                                    false
+                                    (if (= "." (nth func-term-name 0))
+                                      true))]
+               (if dot-something
+                 (list* (symbol ".")
+                        (second x)
+                        (symbol (apply str (rest func-term-name)))
+                        (rest (rest x)))
+                 (let* [ctor-match (if (namespace func-term)
+                                     nil
+                                     (re-find #"^([^./][^/]*)\.$" func-term-name))]
+                   (if ctor-match
+                     (list* (symbol ".")
+                            (symbol (second ctor-match))
+                            (symbol "new")
+                            (rest x))
+                     ;; (xyz ...) where xyz is a macro
+                     (let* [func-r (resolve func-term)]
+                       (if func-r
+                         (let* [m (meta func-r)]
+                           (if (get m :macro)
+                             (let* [args (cons x (cons &env (rest x)))]
+                               (apply func-r args))
+                             x))
+                         x))))))
+             x))
+         x)))
+
+;; Redefine macroexpand, upgrading it from an identity-transform
+(def macroexpand
+  (fn* [x]
+       (loop [x x]
+         (let* [y (macroexpand-1 x)]
+           (if (identical? x y)
+             x
+             (recur y))))))
+
+;; Preliminary "let": no destructuring or binding of same symbol more than once
+(def ^{:macro true} let (fn* [&form &env & stuff] `(let* ~@stuff)))
+
+(def ^{:macro true} cond
+  (fn*
+   [&form &env & clauses]
+   (if (seq clauses)
+     (list 'if (first clauses)
+           (if (next clauses)
+             (second clauses)
+             (throw "cond requires an even number of forms"))
+           (cons `cond (next (next clauses))))
+     nil)))
+
+;; Preliminary "fn" : multiple arity blocks
+(def ^{:macro true} fn (fn* [&form &env & xs]
+  ;; [sym] [docstring] arglist [prepost] & body
+  ;; [sym] [docstring] list ...
+  ;;   where "list" contains:  arglist [prepost] & body
+  (let [a (first xs)
+        sym (if (simple-symbol? a) a nil)
+        xs (if sym (rest xs) xs)
+        single-arity-fn (fn* [sym args body]
+                             `(~'fn* ~@(if sym [sym] nil)
+                               ~args
+                               ~@body))]
+    (cond
+      (vector? (first xs))
+      (let [args (first xs)
+            xs (rest xs)]
+        (single-arity-fn sym args xs))
+      (list? (first xs))
+      (let [params-sym (gensym 'vv)
+            arity-sym (gensym 'arity)
+            vararg? (fn* [params]
+                      (let [n-param-syms (count params)]
+                        (if (perl-infix "<" n-param-syms 2)
+                          false
+                          (= '&
+                             (nth params (perl-infix "-" n-param-syms 2))))))
+            f-sym (reduce1
+                   (fn* [acc params-and-body]
+                        (let [params (first params-and-body)
+                              n-param-syms (count params)
+                              vararg (vararg? params)
+                              k (if vararg "more" n-param-syms)
+                              v (gensym (str "f" k "__"))]
+                          (assoc acc k v)))
+                   {}
+                   xs)
+            f-bindings (reduce1
+                        (fn* [acc params-and-body]
+                          (let [params (first params-and-body)
+                                conditions-and-body (rest params-and-body)
+                                body (if (map? (first conditions-and-body))
+                                       (if (seq (rest conditions-and-body))
+                                         (rest conditions-and-body)
+                                         conditions-and-body)
+                                       conditions-and-body)
+                                n-param-syms (count params)
+                                vararg (vararg? params)
+                                k (if vararg "more" n-param-syms)]
+                            (conj
+                             (conj acc (get f-sym k))
+                             ;; Anonymous: the arity fns must not bind sym, lest a recursive
+                             ;; call by name bypass the dispatcher
+                             `(~'fn* ~params
+                               ~@body))))
+                        []
+                        xs)
+            wrap (fn* [dispatcher]
+                   (if sym
+                     `(~'letfn* ~(conj f-bindings sym dispatcher) ~sym)
+                     `(~'let* ~f-bindings ~dispatcher)))]
+        (wrap
+          `(~'fn* ~@(if sym [sym] nil)
+           [~'& ~params-sym]
+           ~(let [iteration
+                  (fn* iteration [arities]
+                       (let [arity1 (first arities)]
+                         (if (= 1 (count arities))
+                           `(apply ~(let [arglist (first arity1)
+                                          vararg (vararg? arglist)
+                                          n-param-syms (count arglist)
+                                          k (if vararg "more" n-param-syms)
+                                          body (rest arity1)]
+                                      (get f-sym k))
+                                   ~params-sym)
+                           ;; two or more arities - 'if' to distinguish
+                           (let [args (first arity1)]
+                             `(if (= ~(count args) (count ~params-sym))
+                                (apply ~(let [arglist (first arity1)
+                                              vararg (vararg? arglist)
+                                              n-param-syms (count arglist)
+                                              k (if vararg "more" n-param-syms)
+                                              body (rest arity1)]
+                                         (get f-sym k))
+                                       ~params-sym)
+                                ~(iteration (rest arities)))))))]
+              (iteration xs)))))))))
+
+(def ifn? (fn* [x] (satisfies? clojure.core.IFn x)))
+(def fn? (fn* [x] (= Perl.CODE (type x))))
+
+(def ^{:macro true} defn
+  (fn* defn [&form &env s & xs]
+       (if (symbol? s)
+         (let [docstring (if (string? (first xs))
+                           (first xs) nil)
+               xs (if docstring (rest xs) xs)
+               attr-map0 (if (map? (first xs))
+                           (first xs)
+                           (hash-map))
+               attr-map1 (merge attr-map0 (meta s))
+               xs (if (map? (first xs)) (rest xs) xs)
+               attr-map (if docstring
+                          (assoc attr-map1 :doc docstring)
+                          attr-map1)]
+           `(def ~(with-meta s (merge (meta &form) attr-map)) (fn ~s ~@xs)))
+         (throw "Expected symbol"))))
+
+(def ^{:macro true} defmacro (fn* [&form &env s & xs]
+    (if (symbol? s)
+      (let [docstring (if (string? (first xs))
+                        (first xs) nil)
+            xs (if docstring (rest xs) xs)
+            attr-map1 (if (map? (first xs))
+                       (first xs)
+                       (hash-map))
+            xs (if (map? (first xs)) (rest xs) xs)
+            attr-map2 (if docstring
+                       (assoc attr-map1 :doc docstring)
+                       attr-map1)
+            attr-map (assoc attr-map2 :macro true)]
+        `(def ~(with-meta s attr-map)
+           (fn [~'&form ~'&env ~'& pp#] (apply (fn ~@xs) pp#))))
+      (throw "Expected symbol"))))
+
+(defmacro declare [sym]
+  `(def ~sym))
+
+(defn extend [typ & xs]
+  (apply Pajaro/-extend-type typ
+         (loop [ret [], xs xs]
+           (if (seq xs)
+             (recur (conj ret
+                          (let [e (first xs)]
+                            (if (map? e)
+                              (loop [pm #perl {}, es (seq e)]
+                                (if es
+                                  (recur (assoc! pm (name (key (first es))) (val (first es)))
+                                         (next es))
+                                  pm))
+                              e)))
+                    (rest xs))
+             ret))))
+
+;; The Jank Clojure Test Suite expects case to be a Var: so the special form is case* and a macro wraps it
+(defmacro case [& body]
+  `(case* ~@body))
+
+(defn println [ & xs ]
+  (apply print xs)
+  (print "\n"))
+
+(defn prn [ & xs]
+  (apply pr xs)
+  (print "\n"))
+
+(defn array?
+  [x]
+  (instance? Perl.ARRAY x))
+
+(defn ^boolean number?
+  [x]
+  (instance? Pajaro.Number x))
+
+(defn decimal? [x]
+  (= Math.BigFloat (type x)))
+
+(defn ratio? [n]
+  (= Math.BigRat (type n)))
+
+(defn biginteger [x]
+  (Math.BigInt. x))
+
+(defn bigint [x]
+  (Math.BigInt. x))
+
+(defn bigdec [x]
+  (Math.BigFloat. x))
+
+(defn denominator [r]
+  ;; delegate to BigRat method; guard because BigInt and BigFloat also implement the method
+  (if (ratio? r)
+    (.denominator r)
+    (throw "not a ratio")))
+
+(defn numerator [r]
+  ;; delegate to BigRat method; guard because BigInt and BigFloat also implement the method
+  (if (ratio? r)
+    (.numerator r)
+    (throw "not a ratio")))
+
+(defmacro when
+  [test & body]
+  (list 'if test (cons 'do body)))
+
+(defmacro when-not
+  [test & body]
+    (list 'if test nil (cons 'do body)))
+
+(defmacro assert
+  ([x]
+     (when *assert*
+       `(when-not ~x
+          (throw (str "Assert failed: " (pr-str '~x))))))
+  ([x message]
+     (when *assert*
+       `(when-not ~x
+          (throw (str "Assert failed: " ~message "\n" (pr-str '~x)))))))
+
+(defn test
+  [v]
+    (let [f (:test (meta v))]
+      (if f
+        (do (f) :ok)
+        :no-test)))
+
+(defn reverse
+  [coll]
+    (reduce1 conj () coll))
+
+(defn identity [x] x)
+
+(defn comp
+  ([] identity)
+  ([f] f)
+  ([f g]
+   (fn
+     ([] (f (g)))
+     ([x] (f (g x)))
+     ([x y] (f (g x y)))
+     ([x y z] (f (g x y z)))
+     ([x y z & args] (f (apply g x y z args)))))
+  ([f g & fs]
+   (reduce1 comp (spread f g fs))))
+
+(defn int [x]
+  (cond
+    (number? x) (Pajaro.Number/cast_long x)
+    (string? x) (if (= 1 (count x))
+                  (CORE/ord x)
+                  (throw "int cast of string requires a 1-character string"))
+    :else (throw "Number or 1-character string only")))
+
+(def long int)
+
+(defn char [x]
+  ;; Run through int so (char \A), taking the char as its codepoint, => \A
+  (let [cp (int x)]
+    (if (neg? cp)
+      (throw "negative character code")
+      (CORE/chr cp))))
+
+(def double Pajaro.Number/cast_double)
+
+(def float double)
+
+(defn false?
+  [x] (identical? x false))
+
+(defn nil?
+  [x] (identical? x nil))
+
+(defn not
+  [x]
+  (cond
+    (nil? x) true
+    (false? x) true
+    :else false))
+
+(defn not=
+  ([x] false)
+  ([x y] (not (= x y)))
+  ([x y & more]
+   (not (apply = x y more))))
+
+(defn not-empty
+  [coll] (when (seq coll) coll))
+
+(defmacro and
+  ([] true)
+  ([x] x)
+  ([x & next]
+   `(let [and# ~x]
+      (if and# (and ~@next) and#))))
+
+(defn true?
+  [x]
+  (and (builtin/is_bool x) (= true x)))
+
+(defmacro -perl-operator-comparison
+  [operator ;; a string, eg "<"
+   ]
+  (let [my-symbol (symbol operator)]
+    `(def ~my-symbol
+       (letfn* [binary# (fn [x# y#]
+                          (let [x2y2# (Pajaro.Number/promote x# y#)
+                                x2# (nth x2y2# 0)
+                                y2# (nth x2y2# 1)]
+                            (perl-infix ~operator x2# y2#)))]
+               (fn
+                 ([x#] true)
+                 ([x# y#] (binary# x# y#))
+                 ([x# y# ~'& more#]
+                  (if (binary# x# y#)
+                    (if (next more#)
+                      (recur y# (first more#) (next more#))
+                      (binary# y# (first more#)))
+                    false)))))))
+
+(-perl-operator-comparison ">=")
+(-perl-operator-comparison "<=")
+(-perl-operator-comparison ">")
+(-perl-operator-comparison "<")
+
+(defn integer?
+  [n]
+  (if (int? n)
+    true
+    (and
+     (= Math.BigInt (type n))
+     (not (NaN? n))
+     (not= ##Inf n)
+     (not= ##-Inf n))))
+
+(defn rational?
+  [n]
+  (if (integer? n)
+    true
+    (if (ratio? n)
+      true
+      false)))
+
+(defn ^boolean zero?
+  [x]
+  (== 0 x))
+
+(defn bit-and [n b]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? b) (throw "bit math does not take nil"))
+  (perl-statement "use integer")
+  (perl-infix "&" (if n n 0) (if b b 0)))
+
+(defn bit-not [x]
+  (when (nil? x) (throw "bit math does not take nil"))
+  (perl-statement "use integer")
+  (perl-unary "~" x))
+
+(defn bit-and-not [n b] (bit-and n (bit-not b)))
+
+(defn bit-or [n b]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? b) (throw "bit math does not take nil"))
+  (perl-statement "use integer")
+  (perl-infix "|" (if n n 0) (if b b 0)))
+
+(defn bit-xor [n b]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? b) (throw "bit math does not take nil"))
+  (perl-statement "use integer")
+  (perl-infix "^" (if n n 0) (if b b 0)))
+
+(defn bit-shift-left [n b]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? b) (throw "bit math does not take nil"))
+  (perl-statement "use integer")
+  (perl-infix "<<" (if n n 0) (if b b 0)))
+
+(defn bit-shift-right [n b]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? b) (throw "bit math does not take nil"))
+  (perl-statement "use integer")
+  (perl-infix ">>" (if n n 0) (if b b 0)))
+
+(defn bit-clear [n index]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? index) (throw "bit math does not take nil"))
+  (bit-and-not n (bit-shift-left 1 index)))
+
+(defn bit-flip [n index]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? index) (throw "bit math does not take nil"))
+  (bit-xor n (bit-shift-left 1 index)))
+
+(defn bit-set [n index]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? index) (throw "bit math does not take nil"))
+  (bit-or n (bit-shift-left 1 index)))
+
+(defn bit-test [n index]
+  (when (nil? n) (throw "bit math does not take nil"))
+  (when (nil? index) (throw "bit math does not take nil"))
+  (not (zero? (bit-and n (bit-shift-left 1 index)))))
+
+(defn even?
+   [n] (if (integer? n)
+        (zero? (bit-and n 1))
+        (throw (str "Argument must be an integer: " n))))
+
+(defn odd?
+  [n] (not (even? n)))
+
+(defn ^boolean pos?
+  [x]
+  (> x 0))
+
+(defn pos-int?
+  [x] (and (int? x)
+           (pos? x)))
+
+(defn max
+  ([x] x)
+  ([x y] (if (NaN? x) x
+             (if (NaN? y) y
+                 (if (> x y) x y))))
+  ([x y & more]
+   (reduce1 max (max x y) more)))
+
+(defn min
+  ([x] x)
+  ([x y] (if (NaN? x) x
+             (if (NaN? y) y
+                 (if (< x y) x y))))
+  ([x y & more]
+   (reduce1 min (min x y) more)))
+
+(defn complement
+  [f]
+  (fn [& zs] (not (apply f zs))))
+
+(defn constantly
+  [x] (fn [& args] x))
+
+(defn select-keys
+  [map keyseq]
+  (loop [ret {} keys (seq keyseq)]
+    (if keys
+      (let [entry (find map (first keys))]
+        (recur
+         (if entry
+           (conj ret entry)
+           ret)
+         (next keys)))
+      (with-meta ret (meta map)))))
+
+(defn empty?
+  [coll]
+  (cond
+    (nil? coll)
+    true
+
+    (satisfies? ICounted coll)
+    (zero? (count coll))
+
+    :else
+    (not (seq coll))))
+
+(defn every?
+  [pred coll]
+  (cond
+   (nil? (seq coll)) true
+   (pred (first coll)) (recur pred (next coll))
+   :else false))
+
+(def not-every? (comp not every?))
+
+(defn ^boolean some?
+  [x] (not (nil? x)))
+
+(defmacro with-out-str [& body]
+  `(Pajaro/-with-out-str
+    (fn []
+      ~@body)))
+
+(defn char?
+  [x]
+  (and (string? x) (= 1 (count x))))
+
+(defn any?
+  [x] true)
+
+;; aget is different from nth. aget operates at the Perl array level irrespective of blessing. aget does not take a parameter for a default value. Note: Perl arrays are 1-dimensional and do NOT throw if the index is past the end
+(def aget Pajaro.HOPerl/aget)
+(def aset Pajaro.HOPerl/aset)
+(def alength Pajaro.HOPerl/alength)
+(def aclone Pajaro.HOPerl/aclone)
+
+(defmacro amap
+  [a idx ret expr]
+  `(let [a# ~a l# (alength a#)
+         ~ret (aclone a#)]
+     (loop  [~idx 0]
+       (if (< ~idx  l#)
+         (do
+           (aset ~ret ~idx ~expr)
+           (recur (inc ~idx)))
+         ~ret))))
+
+(defmacro areduce
+  [a idx ret init expr]
+  `(let [a# ~a l# (alength a#)]
+     (loop  [~idx 0 ~ret ~init]
+       (if (< ~idx l#)
+         (recur (inc ~idx) ~expr)
+         ~ret))))
+
+;; hget is different from get. hget operates at the Perl hash level irrespective of blessing. hget does not take a parameter for a default value.
+(def hget Pajaro.HOPerl/hget)
+(def hset Pajaro.HOPerl/hset)
+(def hlength Pajaro.HOPerl/hlength)
+(def hclone Pajaro.HOPerl/hclone)
+
+(defmacro if-not
+  ([test then] `(if-not ~test ~then nil))
+  ([test then else]
+   `(if (not ~test) ~then ~else)))
+
+(defn last
+  [s]
+  (let [sn (next s)]
+    (if-not (nil? sn)
+      (recur sn)
+      (first s))))
+
+(defn distinct?
+  ([x] true)
+  ([x y] (not (= x y)))
+  ([x y & more]
+   (if (not (= x y))
+     (loop [s #{x y} xs more]
+       (let [x (first xs)
+             etc (next xs)]
+         (if xs
+           (if (contains? s x)
+             false
+             (recur (conj s x) etc))
+           true)))
+     false)))
+
+(defmacro or
+  ([] nil)
+  ([x] x)
+  ([x & next]
+      `(let [or# ~x]
+         (if or# or# (or ~@next)))))
+
+(defmacro ->
+     [x & forms]
+     (loop [x x, forms forms]
+       (if forms
+         (let [form (first forms)
+                    threaded (if (seq? form)
+                               (with-meta `(~(first form) ~x ~@(next form)) (meta form))
+                               (list form x))]
+           (recur threaded (next forms)))
+         x)))
+
+(defmacro ->>
+  [x & forms]
+  (loop [x x, forms forms]
+    (if forms
+      (let [form (first forms)
+            threaded (if (seq? form)
+              (with-meta `(~(first form) ~@(next form)  ~x) (meta form))
+              (list form x))]
+        (recur threaded (next forms)))
+      x)))
+
+(defmacro comment
+     [& body]
+  nil)
+
+(defmacro if-let
+  ([bindings then]
+   `(if-let ~bindings ~then nil))
+  ([bindings then else & oldform]
+   (let [form (bindings 0) tst (bindings 1)]
+     `(let [temp# ~tst]
+        (if temp#
+          (let [~form temp#]
+            ~then)
+          ~else)))))
+
+(defmacro when-let
+  [bindings & body]
+  (when (< 2 (count bindings))
+    (throw "Too many bindings for when-let"))
+  (let [form (bindings 0) tst (bindings 1)]
+    `(let [temp# ~tst]
+       (when temp#
+         (let [~form temp#]
+           ~@body)))))
+
+(defmacro if-some
+  ([bindings then]
+   `(if-some ~bindings ~then nil))
+  ([bindings then else & oldform]
+   (let [form (bindings 0) tst (bindings 1)]
+     `(let [temp# ~tst]
+        (if (nil? temp#)
+          ~else
+          (let [~form temp#]
+            ~then))))))
+
+(defmacro when-some
+  [bindings & body]
+  (let [form (bindings 0) tst (bindings 1)]
+    `(let [temp# ~tst]
+       (if (nil? temp#)
+         nil
+         (let [~form temp#]
+           ~@body)))))
+
+(defn some
+  [pred coll]
+    (when-let [s (seq coll)]
+      (or (pred (first s)) (recur pred (next s)))))
+
+(def not-any? (comp not some))
+
+(defn simplify-BigRat-to-BigNum [r]
+  (if (= "Math::BigRat" (CORE/ref r))
+    (if (= 1N (denominator r))
+      (numerator r)
+      r)
+    r))
+
+(defn -promote-repromote
+  "Harmonizes a and b, promoting one or the other if their types differed,
+  calls f, and then promotes the result to the same type if it were simpler"
+  [f a b]
+  (let [a'b' (Pajaro.Number/promote a b)
+        a' (aget a'b' 0)
+        b' (aget a'b' 1)
+        ret0 (f a' b')
+        ;; Perl math can simplify results, e.g., 1.0+1.0=2.
+        ;; Re-promote the result to at least align with the args:
+        ret1 (if (ratio? a')
+               (simplify-BigRat-to-BigNum ret0) ;; do not promote return value to BigRat
+               (let [ret1x (Pajaro.Number/promote ret0 a')]
+                 (aget ret1x 0)))]
+    (when (and (not (ratio? a')) (not (= (type a') (type ret1))))
+      (throw (str "Overflow of " (type a') " to " (type ret1))))
+    ret1))
+
+(defn -operator-_PLUS_ [a b] (perl-infix "+" a b))
+(defn -operator-_DASH_ [a b] (perl-infix "-" a b))
+(defn -operator-_STAR_ [a b] (perl-infix "*" a b))
+(defn -operator-_PERCENT_ [a b] (perl-infix "%" a b))
+(defn -operator-_SLASH_ [a b]
+  (if (integer? b)
+    (perl-infix "/" a b) ;; dies on division-by-zero (good)
+    (if (zero? b) ;; Clojure returns ##-Inf ##NaN ##Inf for division by 0.0. The sign, 0.0 vs -0.0, in the divisor does not figure.
+      (if (zero? a)
+        ##NaN
+        (if (neg? a) ;; bug: Clojure regards -0.0 as negative for this purpose but (neg? -0.0) is false (even in Clojure)
+          ##-Inf
+          ##Inf))
+      (perl-infix "/" a b))))
+
+(defmacro -perl-operator-math-fastpath
+  [operator                             ; a string; e.g., +
+   has-nilary
+   identity-value ; value to return if no args ; also used in unary as (op _identity-value-value_ x)
+   ]
+  (let [my-symbol (symbol operator)]
+    `(def ~my-symbol
+       (letfn* [raw2slow# (fn [x# y#]
+                            (-promote-repromote
+                             ~(symbol (str "-operator-" (Pajaro.Munge/munge operator)))
+                             x# y#))
+                raw2# (fn [x# y#]
+                        (if (Pajaro.Number/same_type x# y#)
+                          (let [quick# (perl-infix ~operator x# y#)]
+                            (if (Pajaro.Number/same_type x# quick#)
+                              quick#
+                              (raw2slow# x# y#)))
+                          (raw2slow# x# y#)))]
+               (fn
+                 ~@(when has-nilary
+                     [`([] ~identity-value)])
+                 ([x#]
+                  (simplify-BigRat-to-BigNum (raw2# ~identity-value x#)))
+                 ([x# y#]
+                  (simplify-BigRat-to-BigNum (raw2# x# y#)))
+                 ([x# y# ~'& more#]
+                  (simplify-BigRat-to-BigNum
+                   (reduce1 raw2# (raw2# x# y#) more#))))))))
+
+(-perl-operator-math-fastpath "+" true 0)
+
+(-perl-operator-math-fastpath "-" false 0)
+
+(-perl-operator-math-fastpath "*" true 1)
+
+(defn /
+  ([x] (/ 1 x))
+  ([x y] (if (and (integer? x) (integer? y))
+           (let [ret0 (simplify-BigRat-to-BigNum (Math.BigRat. x y))]
+             (if (integer? ret0) ;; Downgrade BigInt to Long if both args were Long
+               (if (zero? y)
+                 (throw "Division by zero") ;; Non-ints get ##Inf instead of this exception
+                 (let [x'y' (Pajaro.Number/promote x y)
+                       x' (nth x'y' 0)]
+                   (if (int? x')
+                     (int ret0)
+                     ret0)))
+               ret0))
+           (-promote-repromote -operator-_SLASH_ x y)))
+  ([x y & more]
+   (reduce1 / (/ x y) more)))
+
+;; overflow-safe math operations
+;; detect Long underflow and overflow by doing the calculation twice
+;; (once with the given types and again with scalars upcast to BigFloat)
+;; and (if results differ) adjust the types after doing the calculation a third time
+;; (upcast to BigInt - if BigInt and BigFloat upcasts yield equal values
+;; then use the BigInt answer). Note** JVM Clojure remedies integer overflow only, not floating point. But we have a hard time distinguishing in Perl.
+(defmacro -overflow-safe-math
+  [operator             ; a string; e.g., + in which case we define +'
+   has-nilary
+   identity-value ; value to return if no args ; also used in unary as (op _identity-value-value_ x)
+   ]
+  (let [my-symbol (symbol (str operator "'"))]
+    `(defn ~my-symbol
+       ~@(when has-nilary
+           [`([] ~identity-value)])
+       ([x#] (~my-symbol ~identity-value x#))
+       ([x# y#]
+        (if (and (= Pajaro.Long (type x#))
+                 (= Pajaro.Long (type y#)))
+          ;; Long math is the only kind that overflows
+          (try
+            (~(symbol operator) x# y#)
+            (catch :default _oops#
+              (perl-infix ~operator (Math.BigInt. x#) (Math.BigInt. y#))))
+          (do
+            (when (not (number? x#)) (throw "not a number"))
+            (when (not (number? y#)) (throw "not a number"))
+            (~(symbol operator) x# y#))))
+       ([x# y# ~'& more#] (reduce1 ~my-symbol (~my-symbol x# y#) more#)))))
+
+(-overflow-safe-math "+" true 0)
+(-overflow-safe-math "-" false 0)
+(-overflow-safe-math "*" true 1)
+
+(defn neg-int?
+  [x] (and (int? x)
+           (neg? x)))
+
+(defn nat-int?
+  [x] (and (int? x)
+           (not (neg? x))))
+
+(defn dec'
+  [x]
+  (-' x 1))
+
+(defn dec
+  [x]
+  (- x 1))
+
+(defn inc'
+  [x]
+  (+' x 1))
+
+(defn inc
+  [x]
+  (+ x 1))
+
+(defn abs [n]
+  (if (< n 0) (- 0 n) n))
+
+(defmacro defprotocol [nm & more]
+  (if (not (simple-symbol? nm))
+    (throw "Expected simple symbol as protocol name")
+    (let [dqnm (str (ns-name *ns*) "." nm)
+          ;; bypass protocol's optional docstring
+          more (if (string? (first more))
+                 (rest more)
+                 more)]
+      (loop [more more, method-decls #perl {}]
+        (let [a-func (first more)]
+          (if a-func
+	    (if (not (list? a-func))
+	      (throw "Expected list")
+	      (let [a-func-name (first a-func)]
+                (if (not (simple-symbol? a-func-name))
+		  (throw "Expected simple symbol"))
+                (recur (rest more)
+		       (assoc! method-decls (str a-func-name) 1))))
+	    `(Pajaro/_setup_protocol ~dqnm ~method-decls)))))))
+
+(defn juxt
+  ([f]
+   (fn
+     ([] [(f)])
+     ([x] [(f x)])
+     ([x y] [(f x y)])
+     ([x y z] [(f x y z)])
+     ([x y z & args] [(apply f x y z args)])))
+  ([f g]
+   (fn
+     ([] [(f) (g)])
+     ([x] [(f x) (g x)])
+     ([x y] [(f x y) (g x y)])
+     ([x y z] [(f x y z) (g x y z)])
+     ([x y z & args] [(apply f x y z args) (apply g x y z args)])))
+  ([f g h]
+   (fn
+     ([] [(f) (g) (h)])
+     ([x] [(f x) (g x) (h x)])
+     ([x y] [(f x y) (g x y) (h x y)])
+     ([x y z] [(f x y z) (g x y z) (h x y z)])
+     ([x y z & args] [(apply f x y z args) (apply g x y z args) (apply h x y z args)])))
+  ([f g h & fs]
+   (let [fs (list* f g h fs)]
+     (fn
+       ([] (reduce1 #(conj %1 (%2)) [] fs))
+       ([x] (reduce1 #(conj %1 (%2 x)) [] fs))
+       ([x y] (reduce1 #(conj %1 (%2 x y)) [] fs))
+       ([x y z] (reduce1 #(conj %1 (%2 x y z)) [] fs))
+       ([x y z & args] (reduce1 #(conj %1 (apply %2 x y z args)) [] fs))))))
+
+(defmacro deftype [typename-sym members & protocols-and-methods]
+  `(do
+     (deftype* ~typename-sym ~members
+       ~@protocols-and-methods)
+     (defn ~(symbol (str "->" (name typename-sym)))
+       ~members ; [arg1 arg2...]
+       (. ~typename-sym ~'new ~@members))))
+
+;; exceptions
+
+(defn ex-info [msg data]
+  {:msg msg :ex-data data})
+
+(defn ex-data [oops]
+  (:ex-data oops))
+
+;; reduce
+
+(deftype Reduced [val]
+  IDeref
+  (deref [o] val))
+
+(defn reduced
+  [x]
+  (->Reduced x))
+
+(defn reduced?
+  [r]
+  (instance? Reduced r))
+
+(defn ensure-reduced
+  [x]
+  (if (reduced? x) x (reduced x)))
+
+(defn unreduced
+  [x]
+  (if (reduced? x) (deref x) x))
+
+(defn reduce
+  ([f coll]
+    (if-let [s (seq coll)]
+      (reduce f (first s) (next s))
+      (f)))
+  ([f val coll]
+    (loop [val val, coll (seq coll)]
+      (if coll
+        (let [nval (f val (first coll))]
+          (if (reduced? nval)
+            @nval
+            (recur nval (next coll))))
+        val))))
+
+(defn reduce-kv
+  [f init coll]
+  (reduce (fn [ret me]
+            (f ret (key me) (val me)))
+          init coll))
+
+(defprotocol IQuot
+  "Protocol for miscellaneous math operations on (already-promoted) Perl numeric types"
+  (-quot [num div]) ; l.863
+  (-rem [num div] "Remainder of num / div")
+  (-mod [num div] "num modulo div"))
+
+(extend Pajaro.Long
+  IQuot
+  {:-quot (fn [num div] (long (/ num div)))
+   :-rem (fn [num div] (perl-statement "use integer") (perl-infix "%" num div))
+   :-mod (fn [num div] (perl-infix "%" num div))})
+
+(extend Pajaro.Double
+  IQuot
+  {:-quot (fn [num div] (POSIX/trunc (/ num div)))
+   :-rem (fn [num div] (if (infinite? div) ##NaN (POSIX/fmod num div)))
+   :-mod (fn [num div] (let [m (-rem num div)]
+                         (if (or (zero? m) (= (pos? num) (pos? div)))
+                           m
+                           (+ m div))))})
+
+(extend Math.BigInt ;; of which Math.BigFloat and Math.BigRat are subtypes
+  IQuot
+  {:-quot (fn [num div] (let [ret num] (.btdiv ret div) (.as_int ret)))
+   :-rem (fn [num div] (let [ret num] (.btmod ret div) ret))
+   :-mod (fn [num div] (let [ret num] (.bmod ret div) ret))})
+
+(defn quot [num div]
+  (-promote-repromote -quot num div))
+
+(defn rem [num div]
+  (-promote-repromote -rem num div))
+
+(defn mod [num div]
+  (-promote-repromote -mod num div))
+
+;; Atom
+
+(defprotocol IValidated
+  "Protocol for managing a ref's validator function"
+  (get-validator [r] "Validator associated with the ref, or nil if none")
+  (set-validator! [r f] "Unary function that returns false or throws if the value would not be acceptable"))
+
+(defprotocol IAtom
+  "Marker protocol indicating an atom.")
+
+(defprotocol IReset
+  "Protocol for adding resetting functionality."
+  (reset! [a n]
+    "Sets the value of a to n and returns n")
+  (reset-vals! [a n]
+    "Sets the value of a to n and returns [old-value, n]")
+  (compare-and-set! [a o n]
+    "Sets the value of a to n iff its value was o. True if the assignment happened, false if not"))
+
+(defprotocol ISwap
+  "Protocol for adding swapping functionality."
+  (swap! [o f & args]
+    "Swaps the value of o to be (apply f current-value-of-atom args) and returns the new value.")
+  (swap-vals! [o f & args]
+    "Swaps the value of o to be (apply f current-value-of-atom args) and returns [old, new] values."))
+
+(defprotocol IWatchable
+  "Protocol for references that may be watched"
+  (add-watch [this k f])
+  (remove-watch [this k]))
+
+(defn -validate! [validator x]
+  (when (and validator
+             (not (try (validator x) (catch :default _oops false))))
+    (throw "Illegal reference state")))
+
+(defn -atom-notify-watches [r o n]
+  (loop [ws (.-watchers r)]
+    (let [w (first ws)]
+      (when w
+        (let [k (key w)
+              f (val w)]
+          (f k r o n)
+          (recur (rest ws)))))))
+
+(deftype Atom [state meta watchers validator]
+  IAtom
+
+  IEquiv
+  (-equiv [o other] (identical? o other))
+
+  IDeref
+  (deref [_] state)
+
+  IMeta
+  (meta [_] meta)
+
+  IHash
+  (hash [this] 42)
+
+  IReset
+  (reset! [this new-value]
+    (-validate! validator new-value)
+    (let [o state]
+      (set! state new-value)
+      (-atom-notify-watches this o new-value))
+    new-value)
+  (reset-vals! [this new-value]
+    (-validate! validator new-value)
+    (let [o state]
+      (set! state new-value)
+      (-atom-notify-watches this o new-value)
+      [o new-value]))
+  (compare-and-set! [this old-value new-value]
+    (-validate! validator new-value)
+    (if (identical? state old-value)
+      (do
+        (reset! this new-value)
+        true)
+      false))
+
+  IResetMeta
+  (reset-meta! [this m]
+    (when (and m (not (map? m)))
+      (throw "meta must be nil or a map"))
+    (set! meta m))
+
+  ISwap
+  (swap! [this f & args]
+    (let [old state
+          new-value (apply f state args)]
+      (-validate! validator new-value)
+      (set! state new-value)
+      (-atom-notify-watches this old new-value)
+      new-value))
+  (swap-vals! [this f & args]
+    (let [old state
+          new-value (apply f state args)]
+      (-validate! validator new-value)
+      (set! state new-value)
+      (-atom-notify-watches this old new-value)
+      [old new-value]))
+
+  IPr
+  (-pr-str [this]
+    (str "Atom<" (pr-str state) ">"))
+
+  IWatchable
+  (add-watch [this k f]
+    (set! watchers (assoc! watchers k f))
+    this)
+  (remove-watch [this k]
+    (set! watchers (dissoc! watchers k))
+    this)
+
+  IValidated
+  (get-validator [this] validator)
+
+  (set-validator! [this f]
+    (-validate! f state)
+    (set! validator f)
+    nil))
+
+(defn atom
+  [x & opts]
+  ;; destructuring is not available yet at this point in the file
+  (let [opt-map (apply hash-map opts)
+        meta (:meta opt-map)
+        watchers (transient {})
+        validator (:validator opt-map)]
+    (when (and meta (not (map? meta)))
+      (throw "meta must be nil or a map"))
+    (-validate! validator x)
+    (->Atom x meta watchers validator)))
+
+;; No need to distinguish atom from volatile in a single-threaded environment
+(def volatile! atom)
+(def vswap! swap!)
+(def vreset! reset!)
+
+;;
+
+(defn into-array
+  ([aseq]
+   (into-array nil aseq))
+  ([_type aseq]
+   (reduce (fn [a x] (conj! a x)) #perl [] aseq)))
+
+(def to-array into-array)
+
+;; Transducers
+
+;; with forward declarations of the lazy delegates... The lazy arities
+;; of transducer-capable functions won't work until the lazy delegates
+;; are implemented.
+
+(defn completing
+  ([f] (completing f identity))
+  ([f cf]
+   (fn
+     ([] (f))
+     ([x] (cf x))
+     ([x y] (f x y)))))
+
+(defn transduce
+  ([xform f coll] (transduce xform f (f) coll))
+  ([xform f init coll]
+     (let [f (xform f)
+           ret (reduce f init coll)]
+       (f ret))))
+
+(defn preserving-reduced
+  [rf]
+  #(let [ret (rf %1 %2)]
+     (if (reduced? ret)
+       (reduced ret)
+       ret)))
+
+(defn cat
+  [rf]
+  (let [rf1 (preserving-reduced rf)]
+    (fn
+      ([] (rf))
+      ([result] (rf result))
+      ([result input]
+         (reduce rf1 result input)))))
+
+(declare -lazy-map-indexed)
+
+(defn map-indexed
+  ([f]
+   (fn [rf]
+     (let [i (atom -1)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (rf result (f (swap! i inc) input)))))))
+  ([f coll]
+   (-lazy-map-indexed f coll)))
+
+(declare -lazy-keep)
+
+(defn keep
+  ([f]
+   (fn [rf]
+     (fn
+       ([] (rf))
+       ([result] (rf result))
+       ([result input]
+        (let [v (f input)]
+          (if (nil? v)
+            result
+            (rf result v)))))))
+  ([f coll]
+   (-lazy-keep f coll)))
+
+(declare -lazy-keep-indexed)
+
+(defn keep-indexed
+  ([f]
+   (fn [rf]
+     (let [ia (atom -1)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [i (swap! ia inc)
+                v (f i input)]
+            (if (nil? v)
+              result
+              (rf result v))))))))
+  ([f coll]
+   (-lazy-keep-indexed f coll)))
+
+(declare -lazy-map)
+
+(defn map
+  ([f]
+   (fn [rf]
+     (fn
+       ([] (rf))
+       ([result] (rf result))
+       ([result input]
+        (rf result (f input)))
+       ([result input & inputs]
+        (rf result (apply f input inputs))))))
+  ([f & colls]
+   (apply -lazy-map f colls)))
+
+(declare -lazy-take)
+
+(defn take
+  ([n]
+   (when-not (number? n)
+     (throw "Number required"))
+   (fn [rf]
+     (let [na (atom n)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [n @na
+                nn (swap! na dec)
+                result (if (pos? n)
+                         (rf result input)
+                         result)]
+            (if (not (pos? nn))
+              (ensure-reduced result)
+              result)))))))
+  ([n coll]
+   (when-not (number? n)
+     (throw "Number required"))
+   (-lazy-take n coll)))
+
+(declare -lazy-drop)
+
+(defn drop
+  ([n]
+   (when-not (number? n)
+     (throw "Not a number"))
+   (fn [rf]
+     (let [na (atom n)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [n @na]
+            (swap! na dec)
+            (if (pos? n)
+              result
+              (rf result input))))))))
+  ([n coll]
+   (when-not (number? n)
+     (throw "Not a number"))
+   (-lazy-drop n coll)))
+
+(declare -lazy-drop-while)
+
+(defn drop-while
+  ([pred]
+   (fn [rf]
+     (let [da (atom true)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [drop? @da]
+            (if (and drop? (pred input))
+              result
+              (do
+                (reset! da nil)
+                (rf result input)))))))))
+  ([pred coll]
+   (-lazy-drop-while pred coll)))
+
+(declare -lazy-interpose)
+
+(defn interpose
+  ([sep]
+   (fn [rf]
+     (let [started (atom false)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (if @started
+            (let [sepr (rf result sep)]
+              (if (reduced? sepr)
+                sepr
+                (rf sepr input)))
+            (do
+              (reset! started true)
+              (rf result input))))))))
+  ([sep coll]
+   (-lazy-interpose sep coll)))
+
+(declare -lazy-mapcat)
+
+(defn mapcat
+  ([f] (comp (map f) cat))
+  ([f & colls]
+   (apply -lazy-mapcat f colls)))
+
+(declare -lazy-filter)
+
+(defn filter
+  ([pred]
+   (fn [rf]
+     (fn
+       ([] (rf))
+       ([result] (rf result))
+       ([result input]
+        (if (pred input)
+          (rf result input)
+          result)))))
+  ([pred coll]
+   (-lazy-filter pred coll)))
+
+(declare -lazy-remove)
+
+(defn remove
+  ([pred] (filter (complement pred)))
+  ([pred coll]
+   (-lazy-remove pred coll)))
+
+(defn into
+  ([] [])
+  ([to] to)
+  ([to from]
+   (reduce conj to from))
+  ([to xform from]
+   (transduce xform conj to from)))
+
+(defn partial
+  ([f] f)
+  ([f arg1]
+   (fn
+     ([] (f arg1))
+     ([x] (f arg1 x))
+     ([x y] (f arg1 x y))
+     ([x y z] (f arg1 x y z))
+     ([x y z & args] (apply f arg1 x y z args))))
+  ([f arg1 arg2]
+   (fn
+     ([] (f arg1 arg2))
+     ([x] (f arg1 arg2 x))
+     ([x y] (f arg1 arg2 x y))
+     ([x y z] (f arg1 arg2 x y z))
+     ([x y z & args] (apply f arg1 arg2 x y z args))))
+  ([f arg1 arg2 arg3]
+   (fn
+     ([] (f arg1 arg2 arg3))
+     ([x] (f arg1 arg2 arg3 x))
+     ([x y] (f arg1 arg2 arg3 x y))
+     ([x y z] (f arg1 arg2 arg3 x y z))
+     ([x y z & args] (apply f arg1 arg2 arg3 x y z args))))
+  ([f arg1 arg2 arg3 & more]
+   (fn [& args] (apply f arg1 arg2 arg3
+                       (-> [] (into more) (into args))))))
+
+(defn merge-with
+  [f & maps]
+  (when (some identity maps)
+    (let [merge-entry (fn [m e]
+			(let [k (key e) v (val e)]
+			  (if (contains? m k)
+			    (assoc m k (f (get m k) v))
+			    (assoc m k v))))
+          merge2 (fn [m1 m2]
+		   (reduce1 merge-entry (or m1 {}) (seq m2)))]
+      (reduce1 merge2 maps))))
+
+(declare -lazy-replace)
+
+(defn replace
+  ([smap]
+   (map #(if-let [e (find smap %)] (val e) %)))
+  ([smap coll]
+   (-lazy-replace smap coll)))
+
+(declare -lazy-distinct)
+
+(defn distinct
+  ([]
+    (fn [rf]
+      (let [seen (atom #{})]
+        (fn
+          ([] (rf))
+          ([result] (rf result))
+          ([result input]
+            (if (contains? @seen input)
+              result
+              (do (swap! seen conj input)
+                  (rf result input))))))))
+  ([coll]
+    (-lazy-distinct coll)))
+
+(declare -lazy-partition-all)
+
+(defn partition-all
+  ([n]
+   (fn [rf]
+     (let [a (atom (vector))]
+       (fn
+         ([] (rf))
+         ([result]
+          (let [result (if (empty? @a)
+                         result
+                         (let [v @a]
+                           ;;clear first!
+                           (reset! a (vector))
+                           (unreduced (rf result v))))]
+            (rf result)))
+         ([result input]
+          (swap! a conj input)
+          (if (= n (count @a))
+            (let [v @a]
+              (reset! a (vector))
+              (rf result v))
+            result))))))
+  ([n coll]
+   (-lazy-partition-all n coll))
+  ([n step coll]
+   (-lazy-partition-all n step coll)))
+
+(defn partition1 ;; non-lazy version of partition with no specified step
+  [n coll]
+  (let [usable-partitions (quot (count coll) n)]
+    (into []
+          (comp
+           (partition-all n)
+           (take usable-partitions))
+          coll)))
+
+(declare -lazy-partitionv-all)
+
+(defn partitionv-all
+  ([n]
+   (partition-all n))
+  ([n coll]
+   (-lazy-partitionv-all n coll))
+  ([n step coll]
+   (-lazy-partitionv-all n step coll)))
+
+(declare -lazy-take-while)
+
+(defn take-while
+  ([pred]
+   (fn [rf]
+     (fn
+       ([] (rf))
+       ([result] (rf result))
+       ([result input]
+        (if (pred input)
+          (rf result input)
+          (reduced result))))))
+  ([pred coll]
+   (-lazy-take-while pred coll)))
+
+(declare -lazy-take-nth)
+
+(defn take-nth
+  ([n]
+   (when-not (number? n)
+     (throw "Number required"))
+   (when (= 0 n)
+     (throw "Division by zero"))
+   (fn [rf]
+     (let [ia (atom -1)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [i (swap! ia inc)]
+            (if (zero? (rem i n))
+              (rf result input)
+              result)))))))
+  ([n coll]
+   (when-not (number? n)
+     (throw "Number required"))
+   (when (= 0 n)
+     (throw "Division by zero"))
+   (-lazy-take-nth n coll)))
+
+(defn -lazy-partition-by)
+
+(defn partition-by
+  ([f]
+   (fn [rf]
+     (let [a (atom (vector))
+           pa (atom ::none)]
+       (fn
+         ([] (rf))
+         ([result]
+          (let [result (if (empty? @a)
+                         result
+                         (let [v @a]
+                           ;;clear first!
+                           (reset! a (vector))
+                           (unreduced (rf result v))))]
+            (rf result)))
+         ([result input]
+          (let [pval @pa
+                val (f input)]
+            (reset! pa val)
+            (if (or (identical? pval ::none)
+                    (= val pval))
+              (do
+                (swap! a conj input)
+                result)
+              (let [v @a]
+                (reset! a (vector))
+                (let [ret (rf result v)]
+                  (when-not (reduced? ret)
+                    (swap! a conj input))
+                  ret)))))))))
+  ([f coll]
+   (-lazy-partition-by f coll)))
+
+(defn halt-when
+  ([pred] (halt-when pred nil))
+  ([pred retf]
+     (fn [rf]
+       (fn
+         ([] (rf))
+         ([result]
+            (if (and (map? result) (contains? result ::halt))
+              (::halt result)
+              (rf result)))
+         ([result input]
+            (if (pred input)
+              (reduced {::halt (if retf (retf (rf result) input) input)})
+              (rf result input)))))))
+
+(declare -lazy-dedupe)
+
+(defn dedupe
+  ([]
+   (fn [rf]
+     (let [pa (atom ::none)]
+       (fn
+         ([] (rf))
+         ([result] (rf result))
+         ([result input]
+          (let [prior @pa]
+            (reset! pa input)
+            (if (= prior input)
+              result
+              (rf result input))))))))
+  ([coll]
+   (-lazy-dedupe coll)))
+
+;;
+
+(defn interleave*
+  "Non-lazy version of interleave"
+  [& colls]
+  (loop [ret [] colls colls]
+    (if (every? seq colls)
+      (let [firsts (into [] (map first) colls)
+            rests (into [] (map rest) colls)]
+        (recur (into ret firsts) rests))
+      ret)))
+
+(defn split-at
+  [n coll]
+  [(into [] (take n) coll) (into [] (drop n) coll)])
+
+(defn split-with
+  [pred coll]
+  [(into [] (take-while pred) coll) (into [] (drop-while pred) coll)])
+
+(defn merge-with
+  [f & maps]
+  (when (some identity maps)
+    (let [merge-entry (fn [m e]
+			(let [k (key e) v (val e)]
+			  (if (contains? m k)
+			    (assoc m k (f (get m k) v))
+			    (assoc m k v))))
+          merge2 (fn [m1 m2]
+		   (reduce merge-entry (or m1 {}) (seq m2)))]
+      (reduce merge2 maps))))
+
+;; Destructuring
+
+(defn _map_createAsIfByAssoc [arr]
+  (reduce (fn [acc e]
+            (let [k (nth e 0)
+                  v (nth e 1)]
+              (assoc acc k v)))
+          {}
+          (into [] (partition-all 2) arr)))
+
+(defn seq-to-map-for-destructuring
+  "Builds a map from a seq as described in
+  https://clojure.org/reference/special_forms#keyword-arguments (ca Clojure 1.10)"
+  [s]
+  (if (next s)
+    (_map_createAsIfByAssoc s)
+    (if (seq s) (first s) {})))
+
+(defn nnext [x] (next (next x)))
+
+(defn destructure [bindings]
+  (let [bents (into [] (partition-all 2) bindings)
+        pb (fn pb [bvec b v]
+             (let [pvec
+                   (fn [bvec b val]
+                     (let [gvec (gensym "vec__")
+                           gseq (gensym "seq__")
+                           gfirst (gensym "first__")
+                           has-rest (some #{'&} b)]
+                       (loop [ret (let [ret (conj bvec gvec val)]
+                                    (if has-rest
+                                      (conj ret gseq (list `seq gvec))
+                                      ret))
+                              n 0
+                              bs b
+                              seen-rest? false]
+                         (if (seq bs)
+                           (let [firstb (first bs)]
+                             (cond
+                               (= firstb '&) (recur (pb ret (second bs) gseq)
+                                                    n
+                                                    (nnext bs)
+                                                    true)
+                               (= firstb :as) (pb ret (second bs) gvec)
+                               :else (if seen-rest?
+                                       (throw (ex-info "Unsupported binding form, only :as can follow & parameter" {}))
+                                       (recur (pb (if has-rest
+                                                    (conj ret
+                                                          gfirst `(first ~gseq)
+                                                          gseq `(next ~gseq))
+                                                    ret)
+                                                  firstb
+                                                  (if has-rest
+                                                    gfirst
+                                                    (list `nth gvec n nil)))
+                                              (inc n)
+                                              (next bs)
+                                              seen-rest?))))
+                           ret))))
+                   pmap
+                   (fn [bvec b v]
+                     (let [gmap (gensym "map__")
+                           gmapseq (with-meta gmap {:tag 'clojure.lang.IFirstRest})
+                           defaults (:or b)]
+                       (loop [ret (-> bvec (conj gmap) (conj v)
+                                      (conj gmap) (conj `(if (seq? ~gmap)
+                                                           (if (next ~gmapseq)
+                                                             (_map_createAsIfByAssoc ~gmapseq)
+                                                             (if (seq ~gmapseq) (first ~gmapseq) []))
+                                                           ~gmap))
+                                      ((fn [ret]
+                                         (if (:as b)
+                                           (conj ret (:as b) gmap)
+                                           ret))))
+                              bes (let [transforms
+                                        (reduce
+                                         (fn [transforms mk]
+                                           (if (keyword? mk)
+                                             (let [mkns (namespace mk)
+                                                   mkn (name mk)]
+                                               (cond (= mkn "keys") (assoc transforms mk #(keyword (or mkns (namespace %)) (name %)))
+                                                     (= mkn "syms") (assoc transforms mk #(list `quote (symbol (or mkns (namespace %)) (name %))))
+                                                     (= mkn "strs") (assoc transforms mk str)
+                                                     :else transforms))
+                                             transforms))
+                                         {}
+                                         (keys b))]
+                                    (reduce
+                                     (fn [bes entry]
+                                       (reduce #(assoc %1 %2 ((val entry) %2))
+                                               (dissoc bes (key entry))
+                                               ((key entry) bes)))
+                                     (dissoc b :as :or)
+                                     transforms))]
+                         (if (seq bes)
+                           (let [bb (key (first bes))
+                                 bk (val (first bes))
+                                 local (if (ident? bb) (with-meta (symbol nil (name bb)) (meta bb)) bb)
+                                 bv (if (contains? defaults local)
+                                      (list `get gmap bk (defaults local))
+                                      (list `get gmap bk))]
+                             (recur (if (ident? bb)
+                                      (-> ret (conj local bv))
+                                      (pb ret bb bv))
+                                    (next bes)))
+                           ret))))]
+               (cond
+                 (symbol? b) (-> bvec (conj b) (conj v))
+                 (vector? b) (pvec bvec b v)
+                 (map? b) (pmap bvec b v)
+                 :else (throw (ex-info (str "Unsupported binding form: " b) {})))))
+        process-entry (fn [bvec b]
+                        (pb bvec (first b) (second b)))]
+    (if (every? symbol? (into [] (map first) bents))
+      bindings
+      (reduce process-entry [] bents))))
+
+;; revision of let, with destructuring.
+;; Important! the magical interpretation of binding forms is built-into the Reader for the special form let*
+(defmacro let
+  [bindings & body]
+  (if (seq bindings)
+    (list 'let* (destructure (into [] (take 2) bindings))
+          (if-let [more-bindings (next (next bindings))]
+            `(let ~(into [] (drop 2) bindings) ~@body)
+            `(do ~@body)))
+    (concat1 (list 'do) body)))
+
+;; revision of fn, with destructuring
+;; Note: The generated (fn* ...) must match the programmer's arity (vs using [& xs] for example) for recur to align
+(defmacro fn [& xs]
+  ;; [sym] [docstring] arglist [prepost] & body
+  ;; [sym] [docstring] list ...
+  ;;   where "list" contains:  arglist [prepost] & body
+  (let [[sym xs] (let [a (first xs)]
+                   (if (simple-symbol? a)
+                     [a (rest xs)]
+                     [nil xs]))
+        reshape-args (fn* [args]
+                          ;; returns [formal-param-syms destructure-pairs]
+                          (loop [formal-param-syms [] dst-pairs [] args args]
+                            (let [a (first args)]
+                              (if a
+                                (if (= '& a)
+                                  (let [gs (gensym '__varargs)]
+                                    [(conj formal-param-syms a gs)
+                                     (conj dst-pairs (second args) (list `seq gs))])
+                                  (let [gs (gensym '__arg)]
+                                    (recur
+                                     (conj formal-param-syms gs)
+                                     (conj dst-pairs a gs)
+                                     (rest args))))
+                                [formal-param-syms dst-pairs]))))]
+    (cond
+      (vector? (first xs))
+      (let [[args xs] (let [a (first xs)]
+                        (if (vector? a)
+                          [a (rest xs)]
+                          (throw (ex-info "Expected argument vector" {}))))
+            [conditions xs] (let [a (first xs)]
+                              (if (and (< 1 (count xs)) (map? a))
+                                [a (rest xs)]
+                                [nil xs]))]
+        (if (every? symbol? args)
+          ;; No destructuring needed: emit the arg vector (including any
+          ;; & rest-sym) straight through. Important, because the general
+          ;; case below re-bundles the already-rest-collected trailing
+          ;; argument into a synthetic vector and re-walks it with
+          ;; first/next, which double-wraps the rest argument whenever a
+          ;; plain '&' follows one or more plain fixed symbols.
+          `(~'fn* ~@(when sym [sym])
+            ~args
+            ~@xs)
+          (let [[formal-param-syms dst-bindings dst-src]
+                (loop [formal-param-syms [] dst-bindings [] dst-src [] args args]
+                  (let [a (first args)]
+                    (if a
+                      (if (= '& a)
+                        (let [gs (gensym '__varargs)]
+                          [(into formal-param-syms [a gs])
+                           (into dst-bindings args)
+                           (conj dst-src gs)])
+                        (let [gs (gensym '__arg)]
+                          (recur
+                           (conj formal-param-syms gs)
+                           (conj dst-bindings a)
+                           (conj dst-src gs)
+                           (rest args))))
+                      [formal-param-syms dst-bindings dst-src])))]
+            `(~'fn* ~@(when sym [sym])
+              ~formal-param-syms
+              (~'let ~(destructure [dst-bindings dst-src])
+               ~@xs)))))
+
+      (list? (first xs))
+      (let [params-sym (gensym 'vv)
+            arity-sym (gensym 'arity)
+            f-sym (reduce1
+                   (fn [acc params-and-body]
+                     (let [params (first params-and-body)
+                           vararg (some #(= '& %) params)
+                           k (if vararg
+                               :more
+                               (count params))
+                           v (if vararg
+                               (gensym "fmore__")
+                               (gensym (str "f" k "__")))]
+                       (assoc acc k v)))
+                   {}
+                   xs)]
+        (let [form
+              `(~'let*
+          ~(into
+             []
+             (mapcat
+              (fn*
+               [x]
+               (let [[args x] (let [a (first x)]
+                                (if (vector? a)
+                                  [a (rest x)]
+                                  (throw
+                                   (ex-info "Expected argument vector" {}))))
+                     [conditions x] (let [a (first x)]
+                                      (if (and (< 1 (count xs)) (map? a))
+                                        [a (rest x)]
+                                        [nil x]))
+                     vararg (some #(= '& %) args)]
+                 [(get f-sym (if vararg :more (count args)))
+
+                  ;; Each arity clause is compiled to a fn in closure
+                  (if (every? symbol? args)
+                      `(~'fn*
+                        ~args
+                        ~@x)
+                      (let [[formal-param-syms dst-bindings dst-src]
+                            (loop [formal-param-syms [] dst-bindings [] dst-src [] args args]
+                              (let [a (first args)]
+                                (if a
+                                  (if (= '& a)
+                                    (let [gs (gensym '__varargs)]
+                                      [(into formal-param-syms [a gs])
+                                       (into dst-bindings args)
+                                       (conj dst-src gs)])
+                                    (let [gs (gensym '__arg)]
+                                      (recur
+                                       (conj formal-param-syms gs)
+                                       (conj dst-bindings a)
+                                       (conj dst-src gs)
+                                       (rest args))))
+                                  [formal-param-syms dst-bindings dst-src])))]
+                        `(~'fn*
+                          ~formal-param-syms
+                          (~'let ~(destructure [dst-bindings dst-src])
+                           ~@x))))])))
+             xs)
+          ;; dispatch fn:
+          (~'fn* ~@(when sym [sym])
+           [~'& ~params-sym]
+           (let [~arity-sym (count ~params-sym)]
+             (cond
+               ~@(into
+                  []
+                  (mapcat
+                   (fn*
+                    [x]
+                    (let [[args x] (let [a (first x)]
+                                     (if (vector? a)
+                                       [a (rest x)]
+                                       (throw
+                                        (ex-info "Expected argument vector" {}))))
+                          vararg (some #(= '& %) args)]
+                      ;; Pairs for the "cond": arg count check, fn to call
+                      [(if vararg
+                         :else
+                         `(= ~(count args) ~arity-sym))
+                       `(apply ~(get f-sym (if vararg :more (count args)))
+                               ~params-sym)])))
+                  xs)))))]
+          (if sym
+            (list 'letfn* (conj (second form) sym (nth form 2)) sym)
+            form))))))
+
+;;;;;;;;;;;;; nested associative ops ;;;;;;;;;;;
+
+(def ^:private lookup-sentinel #perl {})
+
+(defn get-in
+  ([m ks]
+   (reduce get m ks))
+  ([m ks not-found]
+   (loop [sentinel lookup-sentinel
+          m m
+          ks (seq ks)]
+     (if ks
+       (let [m (get m (first ks) sentinel)]
+         (if (identical? sentinel m)
+           not-found
+           (recur sentinel m (next ks))))
+       m))))
+
+(defn assoc-in
+  [m [k & ks] v]
+  (if ks
+    (assoc m k (assoc-in (get m k) ks v))
+    (assoc m k v)))
+
+(defn update-in
+  [m [k & ks] f & args]
+  (if ks
+    (assoc m k (apply update-in (get m k) ks f args))
+    (assoc m k (apply f (get m k) args))))
+
+(defn update
+  [m k f & args]
+  (assoc m k (apply f (get m k) args)))
+
+(defn fn?
+  [x]
+  (let [t (type x)]
+    (= Perl.CODE t)))
+
+(defn trampoline
+  ([f]
+   (let [ret (f)]
+     (if (fn? ret)
+       (recur ret)
+       ret)))
+  ([f & args]
+   (trampoline #(apply f args))))
+
+(defmacro while
+  [test & body]
+  `(loop []
+     (when ~test
+       ~@body
+       (recur))))
+
+(defn memoize
+  [f]
+  (let [mem (atom {})]
+    (fn [& args]
+      (if-let [e (find @mem args)]
+        (val e)
+        (let [ret (apply f args)]
+          (swap! mem assoc args ret)
+          ret)))))
+
+(defmacro condp
+  [pred expr & clauses]
+  (let [gpred (gensym "pred__")
+        gexpr (gensym "expr__")
+        emit (fn emit [pred expr args]
+               (let [[[a b c :as clause] more]
+                       (split-at (if (= :>> (second args)) 3 2) args)
+                       n (count clause)]
+                 (cond
+                  (= 0 n) `(throw (str "No matching clause: " ~expr))
+                  (= 1 n) a
+                  (= 2 n) `(if (~pred ~a ~expr)
+                             ~b
+                             ~(emit pred expr more))
+                  :else `(if-let [p# (~pred ~a ~expr)]
+                           (~c p#)
+                           ~(emit pred expr more)))))]
+    `(let [~gpred ~pred
+           ~gexpr ~expr]
+       ~(emit gpred gexpr clauses))))
+
+(defmacro letfn
+  [fnspecs & body]
+  `(letfn* ~(vec (interleave* (into [] (map first) fnspecs)
+                              (into [] (map #(cons `fn %)) fnspecs)))
+           ~@body))
+
+(defn fnil
+  ([f x]
+   (fn
+     ([a & more] (apply f (if (nil? a) x a) more))))
+  ([f x y]
+   (fn
+     ([a b & more] (apply f (if (nil? a) x a) (if (nil? b) y b) more))))
+  ([f x y z]
+   (fn
+     ([a b c & more] (apply f (if (nil? a) x a) (if (nil? b) y b) (if (nil? c) z c) more)))))
+
+(defn zipmap
+  [keys vals]
+    (loop [map (transient {})
+           ks (seq keys)
+           vs (seq vals)]
+      (if (and ks vs)
+        (recur (assoc! map (first ks) (first vs))
+               (next ks)
+               (next vs))
+        (persistent! map))))
+
+;; Sorting
+
+(defn ^:private fn->comparator
+  "Given a fn that might be boolean valued or a comparator,
+   return a fn that is a comparator."
+  [f]
+  (if (= f compare)
+    compare
+    (fn [x y]
+      (let [r (f x y)]
+        (if (number? r)
+          r
+          (if r
+            -1
+            (if (f y x) 1 0)))))))
+
+(defn sort
+  ([coll]
+   (sort compare coll))
+  ([comp coll]
+   (if (seq coll)
+     (let [a (to-array coll)]
+       ;; matching Clojure's stable sort
+       (with-meta (vec (perl-sort (fn->comparator comp) a))
+                  (meta coll)))
+     ())))
+
+(defn sort-by
+  ([keyfn coll]
+   (sort-by keyfn compare coll))
+  ([keyfn comp coll]
+   (when-not (fn? comp)
+     (throw "comparator is not a function"))
+   (sort (fn [x y] ((fn->comparator comp) (keyfn x) (keyfn y))) coll)))
+
+(defn group-by
+  [f coll]
+  (persistent!
+   (reduce
+    (fn [ret x]
+      (let [k (f x)]
+        (assoc! ret k (conj (get ret k []) x))))
+    (transient {}) coll)))
+
+;;; Delay
+
+(defprotocol IForce
+  (force [x] "the (possibly cached) value if x is pending, otherwise returns x"))
+
+(defprotocol IPending
+  "Protocol for discovering a delayed value is ready."
+  (realized? [this] "true if a value has been produced for a promise, delay, or lazy sequence"))
+
+(deftype Delay [func realized value]
+  IPending
+  (realized? [this]
+             realized)
+  IForce
+  (force [this]
+    (deref this))
+  IDeref
+  (deref [this]
+         (if realized
+           value
+           (do
+             (set! realized true)
+             (set! value (func))
+             value))))
+
+(defmacro delay
+  [ & body ]
+  `(->Delay (fn [] ~@body) false nil))
+
+(defn delay?
+  [x]
+  (instance? Delay x))
+
+(defn regex? [x]
+  (= Perl.Regexp (type x)))
+
+;; Perl's m/// is NOT anchored unless the regex contains anchors.
+;; To make an anchred re-matches, we use re-find, then check the result covered the entire input
+(defn re-matches [rx s]
+  (if (string? s)
+    (when-let [ret (re-find rx s)]
+      (let [matched (if (vector? ret)
+                      (nth ret 0)
+                      ret)]
+        (when (= s matched)
+          ret)))
+    (throw "re-matches needs a string")))
+
+(defn parse-long [x]
+  (when (re-matches #"[-+]?[0-9]+" x)
+    (let [v (CORE/int x)]
+      (when (int? v)
+        v))))
+
+(defn mapv
+  ([f coll]
+   (-> (reduce (fn [v o]
+                 (conj! v (f o)))
+               (transient [])
+               coll)
+       (persistent!)))
+  ([f coll & more]
+   (loop [ret [] colls (cons coll more)]
+     (let [seqs (mapv seq colls)]
+       (if (every? identity seqs)
+         (recur
+          (conj ret (apply f (mapv first colls)))
+          (mapv rest colls))
+         ret)))))
+
+(defn filterv
+  [pred coll]
+  (-> (reduce (fn [v o] (if (pred o) (conj! v o) v))
+              (transient [])
+              coll)
+      persistent!))
+
+(defmacro defonce [sym x]
+  `(let [qual# (symbol (name (ns-name *ns*)) (name (quote ~sym)))
+         v# (find-var qual#)]
+     (if (and v# (bound? v#))
+       v#
+       (def ~sym ~x))))
+
+;; Lazy sequences
+
+(declare ->LazySeq)
+
+(deftype LazySeq [func isRealized sq m]
+  IMeta
+  (meta [_this]
+    m)
+  IWithMeta
+  (with-meta [_this new-m]
+    (->LazySeq func isRealized sq new-m))
+  IPending
+  (realized? [this] isRealized)
+  IForce
+  (force [this] (if isRealized
+                  sq
+                  (do
+                    (set! isRealized true)
+                    (set! sq (func)))))
+  IHash
+  (hash [this] (hash (vec this)))
+  IFirstRest
+  (-first [this] (first (force this)))
+  (-rest [this] (rest (force this)))
+  IIndexed
+  (nth [this i & etc] (apply nth (force this) i etc))
+  ICount
+  (count [this] (count (force this)))
+  IEmptyable
+  (empty [this] ())
+  IPr
+  (-pr-str [this] (Pajaro/_pr_str_via_seqable this "()"))
+  IPrint
+  (-print-str [this] (Pajaro/_pr_str_via_seqable this "()"))
+  ISeqable
+  (seq [this] (seq (force this)))
+  ISequential)
+
+(defmacro lazy-seq [& body]
+  `(->LazySeq (fn [] ~@body) false nil nil))
+
+(extend Perl.UNIVERSAL
+  IForce
+  {:force identity})
+
+(defn iterate
+  "lazy (infinite!) sequence of x, (f x), (f (f x)) etc.
+  f must be free of side-effects"
+  [f x]
+  (lazy-seq (cons x (iterate f (f x)))))
+
+(defn -lazy-take-while
+  [pred coll]
+  (lazy-seq
+   (when-let [s (seq coll)]
+     (when (pred (first s))
+       (cons (first s) (-lazy-take-while pred (rest s)))))))
+
+(defn range
+  ([]
+   (iterate inc 0))
+  ([end]
+   (if (neg? end)
+     '()
+     (-lazy-take-while #(not (== % end)) (iterate inc 0))))
+  ([start end]
+   (-lazy-take-while #(< % end) (iterate inc start)))
+  ([start end step]
+   (-lazy-take-while #(< % end) (iterate #(+ step %) start))))
+
+;; standard concat has no non-lazy arity. See concat1
+(defn concat
+  ([] (lazy-seq nil))
+  ([x] (lazy-seq x))
+  ([x y]
+   (lazy-seq
+    (if-let [s (seq x)]
+      (cons (first s) (concat (rest s) y))
+      y)))
+  ([x y & zs]
+   (let [cat (fn cat [xys zs]
+               (lazy-seq
+                (if-let [xys (seq xys)]
+                  (cons (first xys) (cat (rest xys) zs))
+                  (when zs
+                    (cat (first zs) (next zs))))))]
+     (cat (concat x y) zs))))
+
+(defn -lazy-map-indexed
+  [f coll]
+  (letfn [(mapi [idx coll]
+            (lazy-seq
+             (when-let [s (seq coll)]
+               (cons (f idx (first s)) (mapi (inc idx) (rest s))))))]
+    (mapi 0 coll)))
+
+(defn -lazy-keep
+  [f coll]
+  (lazy-seq
+   (when-let [s (seq coll)]
+     (let [x (f (first s))]
+       (if (nil? x)
+         (-lazy-keep f (rest s))
+         (cons x (-lazy-keep f (rest s))))))))
+
+(defn -lazy-keep-indexed
+  [f coll]
+  (letfn [(keepi [idx coll]
+            (lazy-seq
+             (when-let [s (seq coll)]
+               (let [x (f idx (first s))]
+                 (if (nil? x)
+                   (keepi (inc idx) (rest s))
+                   (cons x (keepi (inc idx) (rest s))))))))]
+    (keepi 0 coll)))
+
+(defn -lazy-map
+  ([f coll]
+   (lazy-seq
+    (when-let [s (seq coll)]
+      (cons (f (first s)) (-lazy-map f (rest s))))))
+  ([f c1 & colls]
+   (let [step (fn step [cs]
+                (lazy-seq
+                 (let [ss (-lazy-map seq cs)]
+                   (when (every? identity ss)
+                     (cons (-lazy-map first ss)
+                           (step (-lazy-map rest ss)))))))]
+     (-lazy-map #(apply f %) (step (conj colls c1))))))
+
+(defn -lazy-take* ;; assumes n is an integer
+  [n coll]
+  (lazy-seq
+   (when (pos? n)
+     (when-let [s (seq coll)]
+       (cons (first s) (-lazy-take (dec n) (rest s)))))))
+
+(defn -lazy-take ;; casts n to integer
+  [n coll]
+  (-lazy-take* (int n) coll))
+
+(defn -lazy-drop
+  [n coll]
+  (let [step (fn [n coll]
+               (let [s (seq coll)]
+                 (if (and (pos? n) s)
+                   (recur (dec n) (rest s))
+                   s)))]
+    (lazy-seq (step n coll))))
+
+(defn -lazy-drop-while
+  [pred coll]
+  (let [step (fn [pred coll]
+               (let [s (seq coll)]
+                 (if (and s (pred (first s)))
+                   (recur pred (rest s))
+                   s)))]
+    (lazy-seq (step pred coll))))
+
+(defn drop-last
+  ([coll] (drop-last 1 coll))
+  ([n coll] (map (fn [x _] x) coll (drop n coll))))
+
+(defn take-last
+  [n coll]
+  (loop [s (seq coll), lead (seq (drop n coll))]
+    (if lead
+      (recur (next s) (next lead))
+      s)))
+
+;; There is no transducer arity of interleave. See interleave*
+(defn interleave
+  ([] ())
+  ([c1] (lazy-seq c1))
+  ([c1 & colls]
+   (lazy-seq
+    (let [ss (map seq (conj colls c1))]
+      (when (every? identity ss)
+        (concat (map first ss) (apply interleave (map rest ss))))))))
+
+;; repeat has no non-lazy arity
+(defn repeat
+  "Returns a lazy (infinite!, or length n if supplied) sequence of xs."
+  ([x] (lazy-seq (cons x (repeat x))))
+  ([n x] (-lazy-take n (repeat x))))
+
+(defn repeatedly
+  ([f] (lazy-seq (cons (f) (repeatedly f))))
+  ([n f] (-lazy-take n (repeatedly f))))
+
+(defn -lazy-interpose
+  [sep coll]
+  (drop 1 (interleave (repeat sep) coll)))
+
+(defn -lazy-mapcat
+  [f & colls]
+  ;; throw if any "coll" is not a collection
+  (mapv seq colls)
+  (when-not (ifn? f) (throw "Not a function"))
+  (lazy-seq
+   (let [ss (map seq colls)]
+     (when (every? identity ss)
+       (concat (apply f (map first ss))
+               (apply -lazy-mapcat f (map rest ss)))))))
+
+(defn -lazy-filter
+  [pred coll]
+  (lazy-seq
+   (when-let [s (seq coll)]
+     (let [f (first s) r (rest s)]
+       (if (pred f)
+         (cons f (-lazy-filter pred r))
+         (-lazy-filter pred r)))))  )
+
+(defn -lazy-remove
+  [pred coll]
+  (-lazy-filter (complement pred) coll))
+
+(defn -lazy-replace
+  [smap coll]
+  (if (vector? coll)
+    (reduce1 (fn [v i]
+               (if-let [e (find smap (nth v i))]
+                 (assoc v i (val e))
+                 v))
+             coll (range (count coll)))
+    (-lazy-map #(if-let [e (find smap %)] (val e) %) coll)))
+
+(defn -lazy-distinct
+  [coll]
+  (let [step (fn step [xs seen]
+               (lazy-seq
+                ((fn [[f :as xs] seen]
+                   (when-let [s (seq xs)]
+                     (if (contains? seen f)
+                       (recur (rest s) seen)
+                       (cons f (step (rest s) (conj seen f))))))
+                 xs seen)))]
+    (step coll #{})))
+
+(defn nthnext
+  [coll n]
+  (loop [n n xs (seq coll)]
+    (if (and xs (pos? n))
+      (recur (dec n) (next xs))
+      xs)))
+
+(defn nthrest
+  [coll n]
+  (if (pos? n)
+    (or
+     (loop [n n xs coll]
+       (if-let [xs (and (pos? n) (seq xs))]
+         (recur (dec n) (rest xs))
+         (seq xs)))
+      ())
+    coll))
+
+(defn dorun
+  ([coll]
+   (when-let [s (seq coll)]
+     (recur (next s))))
+  ([n coll]
+   (when (and (seq coll) (pos? n))
+     (recur (dec n) (next coll)))))
+
+(defn doall
+  ([coll]
+   (dorun coll)
+   coll)
+  ([n coll]
+   (dorun n coll)
+   coll))
+
+(defn -lazy-partition-all
+  ([n coll]
+   (-lazy-partition-all n n coll))
+  ([n step coll]
+   (lazy-seq
+    (when-let [s (seq coll)]
+      (let [seg (doall (take n s))]
+        (cons seg (-lazy-partition-all n step (nthrest s step))))))))
+
+(defn -lazy-partitionv-all
+  ([n coll]
+   (-lazy-partitionv-all n n coll))
+  ([n step coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [seg (into [] (take n) coll)]
+         (cons seg (-lazy-partitionv-all n step (drop step s))))))))
+
+(defn -lazy-take-nth
+  [n coll]
+  (lazy-seq
+   (when-let [s (seq coll)]
+     (cons (first s) (-lazy-take-nth n (drop n s))))))
+
+(defn -lazy-partition-by
+  [f coll]
+  (lazy-seq
+   (when-let [s (seq coll)]
+     (let [fst (first s)
+           fv (f fst)
+           run (cons fst (-lazy-take-while #(= fv (f %)) (next s)))]
+       (cons run (-lazy-partition-by f (lazy-seq (-lazy-drop (count run) s))))))))
+
+(defn sequence
+  ([coll]
+   (if (seq? coll) coll
+       (or (seq coll) ())))
+  ([xform & colls]
+   (letfn [(step [buf colls]
+             (if (seq buf)
+               (lazy-seq (cons (first buf) (step (rest buf) colls)))
+               (loop [colls colls]
+                 (if (every? seq colls)
+                   (let [firsts (map first colls)
+                         rests (map rest colls)
+                         buf (atom [])
+                         accruing-fn (fn
+                                       ([] nil)
+                                       ([acc] acc)
+                                       ([acc obj]
+                                        (swap! buf conj obj)
+                                        acc))
+                         xf (xform accruing-fn)]
+                     (apply xf nil firsts)
+                     (if (seq @buf)
+                       (lazy-seq (cons (first @buf)
+                                       (step (rest @buf) rests)))
+                       (recur rests)))
+                   ()))))]
+     (step nil colls))))
+
+(defn -lazy-dedupe
+  [coll]
+  (sequence (dedupe) coll))
+
+(defprotocol IClose (close! [this] "closes file handle"))
+
+(extend Perl.FileHandle
+  IClose
+  {:close! (fn [fh] (.close fh))})
+
+(defmacro with-open
+  [bindings & body]
+  (cond
+    (= (count bindings) 0) `(do ~@body)
+    (symbol? (bindings 0)) `(let ~(subvec bindings 0 2)
+                              (try
+                                (with-open ~(subvec bindings 2) ~@body)
+                                (finally
+                                  (close! ~(bindings 0)))))
+    :else (throw "with-open only allows Symbols in bindings")))
+
+(comment
+
+  (with-open [fh (Perl.FileHandle. "somefile.txt" "w")]
+    (binding [*out* fh]
+      (println "\"Hello, file!\"")))
+
+  :-)
+
+(defn read-line* [fh]
+  (when-let [a (.getline fh)]
+    (Pajaro.HOPerl/perl_chomp a)))
+
+(defn read-line []
+  (read-line* *in*))
+
+(comment
+
+  (do
+    (with-open [fh (Perl.FileHandle. "somefile.txt" "w")]
+      (binding [*out* fh]
+        (println "Hello, file!")
+        (println "hello again")))
+
+    (with-open [fh (Perl.FileHandle. "somefile.txt" "r")]
+      (binding [*in* fh]
+        [(read-line) (read-line)])))
+
+  :-)
+
+(defn line-seq
+  [fh]
+  (when-let [line (read-line* fh)]
+    (cons line (lazy-seq (line-seq fh)))))
+
+(comment
+
+  (with-open [fh (Perl.FileHandle. "somefile.txt" "r")]
+    (doall (line-seq fh)))
+  :-)
+
+(defmacro doto
+  [x & forms]
+  (let [gx (gensym)]
+    `(let [~gx ~x]
+       ~@(seq
+          (into []
+                (map (fn [f]
+                       (with-meta
+                         (if (seq? f)
+                           `(~(first f) ~gx ~@(next f))
+                           `(~f ~gx))
+                         (meta f))))
+                forms))
+       ~gx)))
+
+;; Clojure subs : s, start,  end (end is EXCLUSIVE)
+;;  Perl substr : s, offset, length
+(defn subs
+  ([s start]
+   (when-not (string? s) (throw "subs needs a string"))
+   (when-not (number? start) (throw "start index is not a number"))
+   (when-not (<= 0 start (count s)) (throw "start index out of range"))
+   (CORE/substr s start))
+  ([s start end]
+   (when-not (string? s) (throw "subs needs a string"))
+   (when-not (number? start) (throw "start index is not a number"))
+   (when-not (<= 0 start (count s)) (throw "start index out of range"))
+   (when-not (<= start end (count s)) (throw "end index out of range"))
+   (when-not (number? end) (throw "end index is not a number"))
+   (CORE/substr s start (- end start))))
+
+(defn re-seq [re t]
+  (when t
+    (if-let [m (re-find re t)]
+      (let [matched (if (vector? m)
+                      (nth m 0)
+                      m)
+            remainder (subs t (+ (count matched) (CORE/index t matched)))]
+        (cons m (lazy-seq (re-seq re remainder)))))))
+
+(extend Pajaro.COWList
+  IIndexed
+  {:nth (fn
+          ([this i]
+           (if (zero? i)
+             (first this)
+             (when-let [more (next this)]
+               (recur more (dec i)))))
+          ([this i else]
+           (loop [this this i i]
+             (if (zero? i)
+               (first this)
+               (if-let [more (next this)]
+                 (recur more (dec i))
+                 else)))))})
+
+(defn partition
+  ([n coll]
+   (partition n n coll))
+  ([n step coll]
+   (lazy-seq
+    (when-let [s (seq coll)]
+      (let [p (seq (into [] (take n) s))]
+        (when (= n (count p))
+          (cons p (partition n step (nthrest s step))))))))
+  ([n step pad coll]
+   (lazy-seq
+    (when-let [s (seq coll)]
+      (let [p (seq (into [] (take n) s))]
+        (if (= n (count p))
+          (cons p (partition n step pad (nthrest s step)))
+          (list (take n (concat p pad)))))))))
+
+(defmacro when-first
+  [bindings & body]
+  (let [[x xs] bindings]
+    `(when-let [xs# (seq ~xs)]
+       (let [~x (first xs#)]
+           ~@body))))
+
+(defmacro for
+  [seq-exprs body-expr]
+  (let [to-groups (fn [seq-exprs]
+                    (reduce1 (fn [groups [k v]]
+                               (if (keyword? k)
+                                 (conj (pop groups) (conj (peek groups) [k v]))
+                                 (conj groups [k v])))
+                             []
+                             (partition1 2 seq-exprs)))
+        err (fn [& msg] (throw (apply str msg)))
+        emit-bind (fn emit-bind [[[bind expr & mod-pairs]
+                                  & [[_ next-expr] :as next-groups]]]
+                    (let [giter (gensym "iter__")
+                          gxs (gensym "s__")
+                          do-mod (fn do-mod [[[k v :as pair] & etc]]
+                                   (cond
+                                     (= k :let) `(let ~v ~(do-mod etc))
+                                     (= k :while) `(when ~v ~(do-mod etc))
+                                     (= k :when) `(if ~v
+                                                    ~(do-mod etc)
+                                                    (recur (rest ~gxs)))
+                                     (keyword? k) (err "Invalid 'for' keyword " k)
+                                     next-groups
+                                     `(let [iterys# ~(emit-bind next-groups)
+                                            fs# (seq (iterys# ~next-expr))]
+                                        (if fs#
+                                          (concat fs# (~giter (rest ~gxs)))
+                                          (recur (rest ~gxs))))
+                                     :else `(cons ~body-expr
+                                                  (~giter (rest ~gxs)))))]
+                      (if next-groups
+                        #_"not the inner-most loop"
+                        `(fn ~giter [~gxs]
+                           (lazy-seq
+                            (loop [~gxs ~gxs]
+                              (when-first [~bind ~gxs]
+                                ~(do-mod mod-pairs)))))
+                        #_"inner-most loop"
+                        `(fn ~giter [~gxs]
+                           (lazy-seq
+                            (loop [~gxs ~gxs]
+                              (when-let [~gxs (seq ~gxs)]
+                                (let [~bind (first ~gxs)]
+                                  ~(do-mod mod-pairs)))))))))]
+    `(let [iter# ~(emit-bind (to-groups seq-exprs))]
+       (iter# ~(second seq-exprs)))))
+
+(comment
+  (for [a [1 2 3]
+        :when (odd? a)]
+    (inc a))
+
+  (for [a [1 2 3]
+        :when (odd? a)
+        b [:a :b :c]
+        c '(42 43 44)]
+    [(inc a) :b c])
+
+  :-)
+
+(defmacro doseq
+  [seq-exprs & body]
+  (let [step (fn step [recform exprs]
+               (if-not exprs
+                 [true `(do ~@body)]
+                 (let [k (first exprs)
+                       v (second exprs)]
+                   (if (keyword? k)
+                     (let [steppair (step recform (nnext exprs))
+                           needrec (steppair 0)
+                           subform (steppair 1)]
+                       (cond
+                         (= k :let) [needrec `(let ~v ~subform)]
+                         (= k :while) [false `(when ~v
+                                                ~subform
+                                                ~@(when needrec [recform]))]
+                         (= k :when) [false `(if ~v
+                                               (do
+                                                 ~subform
+                                                 ~@(when needrec [recform]))
+                                               ~recform)]))
+                     (let [seq- (gensym "seq_")
+                           count- (gensym "count_")
+                           i- (gensym "i_")
+                           recform `(recur (next ~seq-) 0 0)
+                           steppair (step recform (nnext exprs))
+                           needrec (steppair 0)
+                           subform (steppair 1)]
+                       [true
+                        `(loop [~seq- (seq ~v),
+                                ~count- 0, ~i- 0]
+                           (when-let [~seq- (seq ~seq-)]
+                             (let [~k (first ~seq-)]
+                               ~subform
+                               ~@(when needrec [recform]))))])))))]
+    (nth (step nil (seq seq-exprs)) 1)))
+
+(comment
+
+  (doseq [a [1 2 3]
+          :when (odd? a)]
+    (println "Bankruptcy in progress" a))
+
+  (doseq [a [1 2 3]
+        :when (odd? a)
+        b [:a :b :c]
+        c '(42 43 44)]
+    (println [(inc a) b c]))
+  :-)
+
+(defn update-keys
+  [m f]
+  (let [ret (persistent!
+             (reduce-kv (fn [acc k v] (assoc! acc (f k) v))
+                        (transient {})
+                        m))]
+    (with-meta ret (meta m))))
+
+(defn resultset-seq
+  [sth]
+  (if-let [row (try
+                 (.fetchrow_hashref sth)
+                 (catch :default _oops nil))]
+    (let [kw-row (update-keys row keyword)]
+      (cons kw-row (lazy-seq (resultset-seq sth))))))
+
+(defmacro defn-
+  [name & decls]
+    (list* `defn (with-meta name (assoc (meta name) :private true)) decls))
+
+(defn tree-seq
+   [branch? children root]
+   (let [walk (fn walk [node]
+                (lazy-seq
+                 (cons node
+                  (when (branch? node)
+                    (mapcat walk (children node))))))]
+     (walk root)))
+
+(def file-seq
+  (let [dir-contents ;; including hidden; other than ., ..
+        (fn [d]
+          (with-open [h (Perl.FileHandle.)]
+            (CORE/opendir h d)
+            (into []
+                  (comp (remove #{"." ".."})
+                        (map #(str d "/" %)))
+                  (vector (CORE/readdir h)))))]
+    (fn [dir]
+      (tree-seq
+       (fn node? [x] ;; node?: a directory which is not a symlink (to avoid cycles)
+         (and
+          (Pajaro.HOPerl/filetest_d x)
+          (not (Pajaro.HOPerl/filetest_l x))))
+       dir-contents ;; children
+       dir ;; root
+       ))))
+
+(defn flatten
+  [x]
+  (filter (complement sequential?)
+          (rest (tree-seq sequential? seq x))))
+
+(defn make-hierarchy []
+  (Pajaro.TypeHierarchy.))
+
+(defn alter-var-root [v f & args]
+  (._set_root_binding_BANG_ v (apply f @v args)))
+
+(defn derive
+  ([tag parent]
+   (alter-var-root #'global-hierarchy derive tag parent))
+  ([h tag parent]
+   (-derive h tag parent)))
+
+(defn descendants
+  ([tag]
+   (descendants global-hierarchy tag))
+  ([h tag]
+   (-descendants h tag)))
+
+(def set? (fn* [x] (satisfies? clojure.core.ISet x)))
+
+(defn set [coll]
+  (if (set? coll)
+    coll
+    (into #{} coll)))
+
+(defn isa?
+  ([child parent] (isa? global-hierarchy child parent))
+  ([h child parent]
+   (or (= child parent)
+       (contains? (set (ancestors global-hierarchy child)) parent)
+       (when (not (identical? h global-hierarchy))
+         (contains? (set (ancestors h child)) parent))
+       (and (vector? parent) (vector? child)
+            (= (count parent) (count child))
+            (loop [ret true i 0]
+              (if (or (not ret) (= i (count parent)))
+                ret
+                (recur (isa? h (child i) (parent i)) (inc i))))))))
+
+(defprotocol IMultimethod
+  "Multimethod"
+  (addMethod [this v f])
+  (remove-method [this v])
+  (remove-all-methods [this])
+  (prefer-method [this w l])
+  (methods [this])
+  (get-method [this v])
+  (prefers [this]))
+
+(deftype Multimethod [mm-name dispatch-f dflt h v2f w2l invoke-f]
+  IMultimethod
+  (addMethod [this v f] (set! v2f (assoc v2f v f)) this)
+  (remove-method [this v] (set! v2f (dissoc v2f v)) this)
+  (remove-all-methods [this]
+                      (set! v2f (hash-map))
+                      (set! w2l (hash-map))
+                      this)
+  (prefer-method [this w l] (set! w2l (update w2l w (fnil conj #{}) l)) this)
+  (methods [this] v2f)
+  (prefers [this] w2l)
+  (get-method [this v]
+              (or (get v2f v)
+                  (let [dvs (seq (into []
+                                       (filter v2f) ;; actual dispatch values, still in relevance order
+                                       (ancestors @h v) ;; things that might be dispatch values
+                                       ))
+                        losers (into #{}
+                                     (mapcat w2l)
+                                     dvs)
+                        dv (first (remove losers dvs))
+                        ]
+                    (get v2f dv))
+                  (get v2f dflt)
+                  (throw (str "No method in multimethod '" mm-name "' for dispatch value: " v))))
+  IFn
+  (-code [this] ;; in connection with which, deftype declares "use overload '&{}'"
+         (or invoke-f
+             (set! invoke-f (fn [& args]
+                              (let [v (apply (.-dispatch-f this) args)]
+                                (apply (get-method this v) args))))))
+
+  IPr
+  (-pr-str [this] (str "#<Multimethod-" mm-name ">")))
+
+(defmacro defmulti [mm-name & options]
+  (let [docstring   (if (string? (first options))
+                      (first options)
+                      nil)
+        options     (if (string? (first options))
+                      (next options)
+                      options)
+        m           (if (map? (first options))
+                      (first options)
+                      {})
+        options     (if (map? (first options))
+                      (next options)
+                      options)
+        dispatch-fn (first options)
+        options     (next options)
+        m           (if docstring
+                      (assoc m :doc docstring)
+                      m)
+        m           (if (meta mm-name)
+                      (conj (meta mm-name) m)
+                      m)
+        mm-name (with-meta mm-name m)]
+    (when (= (count options) 1)
+      (throw "The syntax for defmulti has changed. Example: (defmulti name dispatch-fn :default dispatch-value)"))
+    (when-not dispatch-fn
+      (throw "Missing dispatch-fn"))
+    (let [options   (apply hash-map options)
+          default   (get options :default :default)
+          hierarchy (get options :hierarchy #'global-hierarchy)]
+      `(defonce ~mm-name
+         (->Multimethod ~(name mm-name)
+                        ~dispatch-fn
+                        ~default
+                        ~hierarchy
+                        {}
+                        {}
+                        nil)))))
+
+(defmacro defmethod
+  [multifn dispatch-val & fn-tail]
+  `(.addMethod ~multifn ~dispatch-val (fn ~@fn-tail)))
+
+(defn printf [& xs]
+  (print (apply CORE/sprintf xs)))
+
+(defn alter-meta! [r f & args]
+  (reset-meta! r (apply f (meta r) args)))
+
+(alter-meta! #'*ns* assoc :dynamic true)
+
+(defn create-ns [dq-sym]
+  (Pajaro/-setup-ns (name dq-sym)))
+
+(defn intern [ns & xs]
+  (let [ns-object (the-ns ns)]
+    (apply Pajaro/-intern (.get_name ns-object) xs)))
+
+(defn remove-ns [dq-sym]
+  (binding* [*out* *err*]
+            (println "Cannot remove any ns, not even" dq-sym)))
+
+(defn in-ns [dq-sym]
+  (set! clojure.core/*ns* (Pajaro/-setup-ns (name dq-sym)))
+  (let [perlstmt (str "package " (Pajaro/_namespace_munge (.get_name *ns*)) ";")]
+    (perl-eval perlstmt)))
+
+(defn ns-map [ns-clue]
+  (let [ns (the-ns ns-clue)]
+    (reduce
+     (fn [a e]
+       (assoc a (symbol (key e)) (val e)))
+     {}
+     (.contents ns))))
+
+(defn ns-aliases [ns-clue]
+  (let [ns (the-ns ns-clue)]
+    (reduce
+     (fn [a e]
+       (assoc a (symbol (key e)) (val e)))
+     {}
+     (.aliases ns))))
+
+(defn alias [alias namespace-sym]
+  (assoc! (.aliases *ns*) (name alias) (the-ns namespace-sym)))
+
+(defn -ns-map-filtered [ns-clue f]
+  (let [ns (the-ns ns-clue)
+        all (ns-map ns)
+        ns-name-str (.get_name ns)]
+    (reduce
+     (fn [a [k v]]
+       (if (f v)
+         a
+         (dissoc a k)))
+     all
+     all)))
+
+(defn ns-publics [ns-clue]
+  (let [ns (the-ns ns-clue)
+        all (ns-map ns)
+        ns-name-str (.get_name ns)]
+    (-ns-map-filtered
+     ns
+     (fn [v]
+       (and
+        (= "Pajaro::Var" (CORE/ref v))
+        (= ns-name-str (.get_namespace v))
+        (not (re-matches #"^-[a-z]" (.get_name v))))))))
+
+(defn ns-interns [ns-clue]
+  (let [ns (the-ns ns-clue)
+        all (ns-map ns)
+        ns-name-str (.get_name ns)]
+    (-ns-map-filtered
+     ns
+     (fn [v]
+       (and
+        (= "Pajaro::Var" (CORE/ref v))
+        (= ns-name-str (.get_namespace v)))))))
+
+(defn ns-refers [ns-clue]
+  (let [ns (the-ns ns-clue)
+        all (ns-map ns)
+        ns-name-str (.get_name ns)]
+    (-ns-map-filtered
+     ns
+     (fn [v]
+       (and
+        (= "Pajaro::Var" (CORE/ref v))
+        (not= ns-name-str (.get_namespace v)))))))
+
+(defn ns-imports [ns-clue]
+  (let [ns (the-ns ns-clue)
+        all (ns-map ns)
+        ns-name-str (.get_name ns)]
+    (-ns-map-filtered
+     ns
+     (fn [v]
+       (= "Pajaro::Symbol" (CORE/ref v))))))
+
+(defn refer [ns-sym & filters]
+  (let [ns (or (find-ns ns-sym) (throw (str "No namespace: " ns-sym)))
+        fs (apply hash-map filters)
+        nspublics (ns-publics ns)
+        rename (or (:rename fs) {})
+        exclude (set (:exclude fs))
+        to-do (if (= :all (:refer fs))
+                (keys nspublics)
+                (or (:refer fs) (:only fs) (keys nspublics)))]
+    (when (and to-do (not (sequential? to-do)))
+      (throw (str ":only/:refer value must be a sequential collection of symbols, but got " (pr-str to-do))))
+    (doseq [sym to-do]
+      (when-not (exclude sym)
+        (let [v (nspublics sym)]
+          (when-not v
+            (if (get (ns-interns ns) sym)
+              (throw (str sym " is not public"))
+              (throw (str sym " does not exist"))))
+          (intern *ns* (or (rename sym) sym) v)))))
+  *ns*)
+
+(defn refer-clojure [& _xs]
+  (refer (symbol "clojure.core")))
+
+(defmacro ns
+  ;; clojure.core -> Pajaro
+  ;; rmv gen-class
+  ;; waive the name-metadata part...
+  ;; .equals -> with =
+  ;; rmv dosync and commute->swap!
+  ;; elide with-loading-context
+  [name & references]
+  (let [process-reference
+        (fn [[kname & args]]
+          `(~(symbol "clojure.core" (clojure.core/name kname))
+             ~@(seq (into []
+                          (map #(list 'quote %))
+                          args))))
+        docstring  (when (string? (first references)) (first references))
+        references (if docstring (next references) references)
+        name (if docstring
+               (vary-meta name assoc :doc docstring)
+               name)
+        metadata   (when (map? (first references)) (first references))
+        references (if metadata (next references) references)
+        name (if metadata
+               (vary-meta name merge metadata)
+               name)
+        name-metadata (meta name)]
+    `(do
+       (clojure.core/in-ns '~name)
+       ~@(when name-metadata
+           `((reset-meta! (clojure.core/the-ns '~name) ~name-metadata)))
+       ~@(when (and (not= name 'clojure.core) (not-any? #(= :refer-clojure (first %)) references))
+           `((clojure.core/refer '~'clojure.core)))
+       ~@(seq (into []
+                    (map process-reference)
+                    references))
+        (if (= '~name 'clojure.core)
+          nil
+          (do (swap! @#'*loaded-libs* conj '~name) nil)))))
+
+(defonce ^:dynamic *loaded-libs* (atom #{'clojure.core}))
+
+(defonce ^:dynamic *pending-paths* ())
+
+(defonce ^:dynamic *loading-verbosely* false)
+
+(defn -throw-if
+  [pred fmt & args]
+  (when pred
+    (let [message (apply str fmt args)]
+      (throw message))))
+
+(defn -libspec?
+  [x]
+  (or (symbol? x)
+      (and (vector? x)
+           (or
+            (nil? (second x))
+            (keyword? (second x))))))
+
+(defn -prependss
+  "Prepends a symbol or a seq to coll"
+  [x coll]
+  (if (symbol? x)
+    (cons x coll)
+    (concat1 x coll)))
+
+(def re-quote CORE/quotemeta)
+
+(defn -root-resource
+  "Returns the root directory path for a lib"
+  [lib]
+  (str \/
+       (-> (name lib)
+           (Pajaro.HOPerl/perl_replace_all \- \_)
+           (Pajaro.HOPerl/perl_replace_all (re-quote \.) \/))))
+
+(defn -root-directory
+  "Returns the root resource path for a lib"
+  [lib]
+  (let [[_ d] (re-matches #"(.*)/[^/]*" (-root-resource lib))]
+    d))
+
+(defn -load-one
+  [lib need-ns require]
+  (load (-root-resource lib))
+  (-throw-if (and need-ns (not (find-ns lib)))
+            "namespace '%s' not found after loading '%s'"
+            lib (-root-resource lib))
+  (when require
+    (swap! *loaded-libs* conj lib)))
+
+(defn -load-all
+  [lib need-ns require]
+  (swap! *loaded-libs* #(reduce1 conj %1 %2)
+         (binding* [*loaded-libs* (atom #{})]
+           (-load-one lib need-ns require)
+           @*loaded-libs*)))
+
+(defn -load-lib
+  [prefix lib & options]
+  (-throw-if (and prefix (re-find #"[.]" (name lib)))
+             "Found lib name '%s' containing period with prefix '%s'.  lib names inside prefix lists must not contain periods"
+             (name lib) prefix)
+  (let [lib (if prefix (symbol (str prefix \. lib)) lib)
+        opts (apply hash-map options)
+        {:keys [as reload reload-all require use verbose as-alias]} opts
+        loaded (contains? @*loaded-libs* lib)
+        need-ns (or as use)
+        load (cond reload-all -load-all
+                   reload -load-one
+                   (not loaded) (cond need-ns -load-one
+                                      as-alias (fn [lib _need _require] (create-ns lib))
+                                      :else -load-one))
+
+        filter-opts (select-keys opts '(:exclude :only :rename :refer))
+        undefined-on-entry (not (find-ns lib))]
+    (binding* [*loading-verbosely* (or *loading-verbosely* verbose)]
+      (if load
+        (try
+          (load lib need-ns require)
+          (catch :default e
+            (when undefined-on-entry
+              (remove-ns lib))
+            (throw e)))
+        (-throw-if (and need-ns (not (find-ns lib)))
+                   "namespace '%s' not found" lib))
+      (when (and need-ns *loading-verbosely*)
+        (printf "(clojure.core/in-ns '%s)\n" (ns-name *ns*)))
+      (when as
+        (when *loading-verbosely*
+          (printf "(clojure.core/alias '%s '%s)\n" as lib))
+        (alias as lib))
+      (when as-alias
+        (when *loading-verbosely*
+          (printf "(clojure.core/alias '%s '%s)\n" as-alias lib))
+        (alias as-alias lib))
+      (when (or use (:refer filter-opts))
+        (when *loading-verbosely*
+          (printf "(clojure.core/refer '%s" lib)
+          (doseq [opt filter-opts]
+            (printf " %s '%s" (key opt) (print-str (val opt))))
+          (printf ")\n"))
+        (apply refer lib (into []
+                               (mapcat seq)
+                               filter-opts))))))
+
+(defn -load-libs
+  "Loads libs, interpreting libspecs, prefix lists, and flags for
+  forwarding to load-lib"
+  [& args]
+  (let [flags (into []
+                    (filter keyword?)
+                    args)
+        opts (interleave* flags (repeat true))
+        args (seq (into []
+                        (filter (complement keyword?))
+                        args))]
+    ;; check for unsupported options
+    (let [supported #{:as :reload :reload-all :require :use :verbose :refer :as-alias}
+          unsupported (seq (into []
+                                 (remove supported)
+                                 flags))]
+      (-throw-if unsupported
+                 (apply str "Unsupported option(s) supplied: "
+                        (into []
+                              (interpose \,)
+                              unsupported))))
+                                        ; check a load target was specified
+    (-throw-if (not (seq args)) "Nothing specified to load")
+    (doseq [arg args]
+      (if (-libspec? arg)
+        (apply -load-lib nil (-prependss arg opts))
+        (let [[prefix & args] arg]
+          (-throw-if (nil? prefix) "prefix cannot be nil")
+          (doseq [arg args]
+            (apply -load-lib prefix (-prependss arg opts))))))))
+
+(defn -check-cyclic-dependency
+  [path]
+  (when (some #{path} (rest *pending-paths*))
+    (let [pending (into []
+                        (map #(if (= % path) (str "[ " % " ]") %))
+                        (cons path *pending-paths*))
+          chain (apply str (into []
+                                 (interpose "->")
+                                 pending))]
+      (-throw-if true "Cyclic load dependency: %s" chain))))
+
+(defn require
+  [& args]
+  ;; Detect collision with Perl's require and delegate to it.
+  ;; Perl's "use" and "no" statements generate a "require" call!
+  (if (and (= 1 (count args))
+           (string? (nth args 0)))
+    (do
+      ((perl-eval "sub{my $x=shift;CORE::require $x}") (nth args 0)))
+    (apply -load-libs :require args)))
+
+(defn import* [pkg args]
+  (when-not (re-matches #"[_.a-zA-Z0-9]+" pkg)
+    (throw (str "Bad package name. Use Data.Dumper for Data::Dumper")))
+  (let [perlpkg (Pajaro.HOPerl/perl_replace_all pkg #"[.]" "::")
+        arglist (when (seq args)
+                  (str "("
+                       (apply str
+                              (into []
+                                    (comp
+                                     (map pr-str)
+                                     (interpose ","))
+                                    args))
+                       ")"))
+        perlstmt (str "use " perlpkg arglist ";")]
+    (perl-eval perlstmt)))
+
+;; Hazard! Collision with Perl's implicit module-"import"
+;; (which Perl invokes after "require" or "use")...
+;; kluged by `intern` putting a decoy into Perl's symbol table.
+;; Thus the import macro is callable only via the Var (scalar entry in symbol table).
+(defmacro import
+  [& import-symbols-or-lists]
+  (let [specs (into []
+                    (map #(if (and (seq? %) (= 'quote (first %)))
+                            (second %)
+                            %))
+              import-symbols-or-lists)]
+    `(do ~@(into []
+                 (map (fn [spec]
+                        (if (symbol? spec)
+                          (list 'clojure.core/import* (name spec) nil)
+                          (list 'clojure.core/import* (name (first spec))
+                                (into [] (map str) (second spec))))))
+                 specs))))
+
+(defprotocol IRecord
+  "Marker protocol indicating a record.")
+
+(defmacro defrecord [recname-sym members & protocols-and-methods]
+  ;; TYPE member _* is a COWMap of the members
+  (let [mbr-perl (fn* [mbr-sym]
+                      `(get ~'_* ~(keyword (name mbr-sym))))
+        basis-ks (into #{}
+                       (map (comp keyword name))
+                       members)
+	dotted-recname-sym (symbol
+                            (str (name (ns-name *ns*))
+                                 "." (name recname-sym)))
+        typ-ctor-sym (gensym (str "new-" (name recname-sym)))]
+    `(do
+       (declare ~typ-ctor-sym)
+       (deftype* ~recname-sym
+         :constructor "new0" ;; deftype's ctor will be "new0"; ours (below) is "new"
+         [~'_* ~'mt]
+         ;; user-defined methods
+         ~@(map
+            (fn method* [protocol-or-method]
+              (if (symbol? protocol-or-method)
+                protocol-or-method ;; i.e., protocol symbol
+                (if (list? protocol-or-method) ;; i.e., method implementation
+                  (let [[method-symbol method-args & method-body] protocol-or-method]
+                    `(~method-symbol
+                      ~method-args
+                      (let [~@(into []
+                                    (mapcat
+                                     (fn member* [member]
+                                       (list member (mbr-perl member))))
+                                    members)]
+                        ~@method-body)))
+                  (throw "expected protocol (symbol) or method (list)"))))
+            protocols-and-methods)
+         ;; automatic methods
+         ~'clojure.core.IRecord
+         ~'clojure.core.ICloneable
+         (~'clone [~'this]
+          (~typ-ctor-sym ~'_* ~'mt))
+         ~'clojure.core.IHash
+         (~'hash [~'this] (inc (hash ~'_*)))
+         ~'clojure.core.IEquiv
+         (~'-equiv [~'this ~'other]
+          (and
+           (= (type ~'this) (type ~'other))
+           (= ~'_* (hget ~'other "_*"))))
+         ~'clojure.core.IMeta
+         (~'meta [~'this] ~'mt)
+         ~'clojure.core.IPr
+         (~'-pr-str [~'this]
+          (str "<" ~(name dotted-recname-sym) "=" ~'_* ">"))
+         ~'clojure.core.IPrint
+         (~'-pr-str [~'this]
+          (str "<" ~(name dotted-recname-sym) "=" ~'_* ">"))
+         ~'clojure.core.IWithMeta
+         (~'with-meta [~'this meta#]
+          ;; should we enforce meta is nil or a map?
+          (~typ-ctor-sym ~'_* meta#))
+         ~'clojure.core.IAssoc
+         (~'assoc [~'this ~'& args#]
+          (~typ-ctor-sym (apply assoc ~'_* args#) ~'mt))
+         ~'clojure.core.IAssociative
+         ~'clojure.core.IDissoc
+         (~'dissoc [~'this ~'& ks#]
+          (let [content# (apply dissoc ~'_* ks#)]
+            (if (seq (into []
+                           (filter ~basis-ks)
+                           ks#))
+              content#
+              (~typ-ctor-sym content# ~'mt))))
+         ~'clojure.core.IFind
+         (~'find [~'this ~'& args#]
+          (apply find ~'_* args#))
+         ~'clojure.core.IKeysVals
+         (~'keys [~'this]
+          (keys ~'_*))
+         (~'vals [~'this]
+          (vals ~'_*))
+         ~'clojure.core.ILookup
+         (~'contains? [~'this k#]
+          (contains? ~'_* k#))
+         (~'get [~'this ~'& args#]
+          (apply get ~'_* args#))
+         ~'clojure.core.ISeqable
+         (~'seq [~'this]
+          (seq ~'_*)))
+       (defn ~typ-ctor-sym [mbrmap# meta#]
+         (. ~dotted-recname-sym ~'new0 mbrmap# meta#))
+       (defn ~(symbol (str "->" (name recname-sym)))
+         ~members                       ; [arg1 arg2...]
+         (let [mbrmap# ~(zipmap
+                         (into []
+                               (map (comp keyword name))
+                               members)
+                         members)
+               meta# nil]
+           (. ~dotted-recname-sym ~'new0 mbrmap# meta#)))
+       (defn ~(symbol (str "map->" (name recname-sym)))
+         [m#]
+         (let [empty-basis-map# ~(zipmap (into []
+                                               (map (comp keyword name))
+                                               members)
+                                         (repeat nil))
+               meta# nil]
+           (. ~dotted-recname-sym ~'new0 (merge empty-basis-map# m#) meta#)))
+       (let [new-code#
+             '(fn* ~(vec (cons '_ members))
+                          (let [mbrmap# ~(zipmap
+                                          (into []
+                                                (map (comp keyword name))
+                                                members)
+                                          members)
+                                meta# nil]
+                            (. ~dotted-recname-sym ~'new0 mbrmap# meta#)))
+             new-perlcode# (Pajaro.Salt/toPerl
+                            (Pajaro.Transpiler/transpile
+                             #perl {}   ; options
+                             new-code#
+                             #perl {}   ; env
+                             ))
+             in-pkg-perlcode# (str "{package " ~(Pajaro/-namespace-munge
+                                                 (clojure.core/name dotted-recname-sym)) ";"
+                                   "no warnings qw(redefine);"
+                                   "*new = " new-perlcode# ";"
+                                   "}")]
+         (perl-eval in-pkg-perlcode#)))))
+
+(def record? (fn* [x] (satisfies? clojure.core.IRecord x)))
+
+(import 'Time.HiRes)
+
+(defn sleep [ms]
+  (Time.HiRes/sleep (/ ms 1000))
+  nil)
+
+(defn cycle [coll]
+  (if (seq coll)
+    (letfn [(cycler [current]
+              (lazy-seq (cons (first current)
+                              (cycler (or (next current) coll)))))]
+      (cycler coll))
+    ()))
+
+(defmacro binding [bindings & body]
+  (let [pairs (partition1 2 bindings)
+        vars (into [] (map first) pairs)
+        exprs (into [] (map second) pairs)
+        temps (repeatedly (count pairs) gensym)
+        temp-bindings (interleave* temps exprs)
+        dynamic-bindings (interleave* vars temps)]
+    `(let [~@temp-bindings]
+       (binding* [~@dynamic-bindings]
+                 ~@body))))
+
+(def format CORE/sprintf)
+
+(defn butlast [s]
+  (loop [ret [] s s]
+    (if (next s)
+      (recur (conj ret (first s)) (next s))
+      (seq ret))))
+
+(defn int-array
+  ([size-or-seq]
+   (if (coll? size-or-seq)
+     (into-array (map int size-or-seq))
+     (into-array (repeat size-or-seq 0))))
+  ([size init-val-or-seq]
+   (if (coll? init-val-or-seq)
+     (into-array (take size (concat (map int init-val-or-seq) (repeat 0))))
+     (into-array (repeat size (int init-val-or-seq))))))
+
+(def long-array int-array)
+
+(defn double-array
+  ([size-or-seq]
+   (if (coll? size-or-seq)
+     (into-array (map double size-or-seq))
+     (into-array (repeat size-or-seq 0.0))))
+  ([size init-val-or-seq]
+   (if (coll? init-val-or-seq)
+     (into-array (take size (concat (map double init-val-or-seq) (repeat 0.0))))
+     (into-array (repeat size (double init-val-or-seq))))))
+
+(def float-array double-array)
+
+(defn object-array [size-or-seq]
+  (if (coll? size-or-seq)
+    (into-array size-or-seq)
+    (into-array (repeat size-or-seq nil))))
+
+(defn some-fn
+  [& preds]
+  (when (zero? (count preds))
+    (throw "Predicates missing"))
+  (if (not-every? ifn? preds)
+    (fn [& args]
+      (throw "Predicates must be fns"))
+    (fn [& args]
+    (loop [preds preds]
+      (when-let [pred (first preds)]
+        (or (loop [args args]
+              (when-let [arg (first args)]
+                (or (pred arg)
+                    (recur (rest args)))))
+            (recur (rest preds))))))))
+
+(defn rand
+  ([]
+   (CORE/rand 1))
+  ([n]
+   (CORE/rand n)))
+
+(defn rand-int [n]
+  (int (CORE/rand n)))
+
+(defn rand-nth
+  [coll]
+  (nth coll (rand-int (count coll))))
+
+(defn random-sample
+  ([prob]
+   (filter (fn [_] (< (rand) prob))))
+  ([prob coll]
+   (filter (fn [_] (< (rand) prob)) coll)))
+
+(defn counted? [x] (satisfies? clojure.core.ICounted x))
+
+(defmacro extend-type
+  [typ & protos-meths]
+  ;; Pajaro/-extend-type takes alternating protocol object & PERL map of method name => CODE
+  (let [proto->meths (loop [ret {} current-proto nil p-ms protos-meths]
+                       (if-let [p-m (first p-ms)]
+                         (if (symbol? p-m)
+                           (recur
+                            (assoc ret p-m #perl {})
+                            p-m
+                            (rest p-ms))
+                           (recur
+                            (update ret
+                                    current-proto
+                                    assoc!
+                                    (name (first p-m))
+                                    (cons 'clojure.core/fn p-m))
+                            current-proto
+                            (rest p-ms)))
+                         ret))]
+   `(apply Pajaro/-extend-type
+          ~typ
+          ~(into []
+                 (mapcat identity)
+                 proto->meths))))
+
+(defmacro extend-protocol
+  [proto & types-meths]
+  ;; Pajaro/_extend_protocol takes proto, 1 type, 1 PERL map of methodname=>CODE
+  (let [type->meths (loop [ret {} current-type nil t-ms types-meths]
+                       (if-let [t-m (first t-ms)]
+                         (if (symbol? t-m)
+                           (recur
+                            (assoc ret t-m #perl {})
+                            t-m
+                            (rest t-ms))
+                           (recur
+                            (update ret
+                                    current-type
+                                    assoc!
+                                    (name (first t-m))
+                                    (cons 'clojure.core/fn t-m))
+                            current-type
+                            (rest t-ms)))
+                         ret))]
+    `(do
+       ~@(seq
+          (into []
+                (map
+                 (fn [[t mm]]
+                   `(Pajaro/_extend_protocol ~proto ~t ~mm)))
+                type->meths)))))
+
+(defn parse-boolean
+  [s]
+  (if (string? s)
+    (case s
+      "true" true
+      "false" false
+      nil)
+    (throw (str "Expected string, got " (type s)))))
+
+(defn println-str
+  [& xs]
+  (str (apply print-str xs) "\n"))
+
+(defn prn-str
+  [& xs]
+  (str (apply pr-str xs) "\n"))
+
+(Pajaro/-extend-type Pajaro.Var IWatchable)
+
+;;---  promises
+
+(defprotocol IPromise
+  (deliver [this x]))
+
+(defn -promise-notify-watches [r o n]
+  (loop [ws (.-watchers r)]
+    (let [w (first ws)]
+      (if w
+        (let [k (key w)
+              f (val w)]
+          (f k r o n)
+          (recur (rest ws)))
+        nil))))
+
+(deftype Promise [delivered payload meta watchers]
+  IPromise
+  (deliver [this x]
+    (if-not delivered
+      (let [o payload]
+        (set! delivered true)
+        (set! payload x)
+        (-promise-notify-watches this o payload)
+        this)
+      nil))
+
+  IEquiv
+  (-equiv [o other] (identical? o other))
+
+  IDeref
+  (deref [_]
+    (when-not delivered
+      (throw (ex-info "Promise not delivered" {})))
+    payload)
+
+  IFn
+  (-code [this]
+    (fn [x] (deliver this x)))
+
+  IMeta
+  (meta [_] meta)
+
+  IHash
+  (hash [this] 42)
+
+  IPending
+  (realized? [this]
+    delivered)
+
+  IResetMeta
+  (reset-meta! [this m]
+    (when (and m (not (map? m)))
+      (throw "meta must be nil or a map"))
+    (set! meta m))
+
+  IPr
+  (-pr-str [this]
+    (str "Promise<" (if delivered (pr-str payload) "undelivered") ">"))
+
+  IWatchable
+  (add-watch [this k f]
+    (set! watchers (assoc! watchers k f))
+    this)
+  (remove-watch [this k]
+    (set! watchers (dissoc! watchers k))
+    this))
+
+(defn promise
+  []
+  (->Promise false nil {} {}))
+
+(defn rationalize [n]
+  (simplify-BigRat-to-BigNum (rationalize* n)))

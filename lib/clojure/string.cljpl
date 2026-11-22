@@ -1,0 +1,166 @@
+;; Clojure string.clj:
+;   Copyright (c) Rich Hickey. All rights reserved.
+;   The use and distribution terms for this software are covered by the
+;   Eclipse Public License 1.0 (http://opensource.org/licenses/eclipse-1.0.php)
+;   which can be found in the file epl-v10.html at the root of this distribution.
+;   By using this software in any fashion, you are agreeing to be bound by
+;   the terms of this license.
+;   You must not remove this notice, or any other, from this software.
+
+;; Adaptations for Pajaro: Copyright (c) 2026 by Phill Wolf
+
+(ns clojure.string
+  (:refer-clojure :exclude (replace reverse)))
+
+;(set! *warn-on-reflection* true)
+
+(def reverse
+  "s with its characters reversed."
+  (perl-eval "sub{my$s=shift;die q(Nil) unless defined($s);if(!clojure::core::string_QMARK_($s)){die q(Not a string)}else{scalar CORE::reverse($s)}}"))
+
+(def re-quote-replacement re-quote)
+
+(defn unwrap-if-no-captured-groups
+  "The sole element of a 1-element Perl array, or the whole Perl array if it is larger than 1 element"
+  [g]
+  (if (= 1 (count g))
+    (nth g 0)
+    g))
+
+(defn perl-replace-all-f [s m f]
+  (Pajaro.HOPerl/perl_replace_all s m (comp f unwrap-if-no-captured-groups)))
+
+(defn perl-replace-first-f [s m f]
+  (Pajaro.HOPerl/perl_replace_first s m (comp f unwrap-if-no-captured-groups)))
+
+(defn replace*
+  [thoroughness s match repla]
+  (let [s (str s)
+        delegates {:all {:str Pajaro.HOPerl/perl_replace_all :func perl-replace-all-f}
+                   :first {:str Pajaro.HOPerl/perl_replace_first :func perl-replace-first-f}}
+        match-is-regex (regex? match)
+        regex (if match-is-regex
+                match
+                (re-pattern (re-quote match)))
+        group-interpolation-re (re-pattern "\\$([1-9])")
+        repla* (cond
+                 (ifn? repla) repla
+                 (not match-is-regex) (re-quote-replacement repla)
+                 (not (string? repla)) (throw "Expected string or fn for replacement")
+                 (re-find group-interpolation-re repla) (fn [groups]
+                                                          (replace*
+                                                           :all
+                                                           repla
+                                                           group-interpolation-re
+                                                           (fn [[_ i]]
+                                                             (nth groups (parse-long i)))))
+                 :else repla)
+        replacement-type (if (ifn? repla*) :func :str)
+        delegate (get-in delegates [thoroughness replacement-type])]
+    (delegate s regex repla*)))
+
+(defn replace
+  [s match repla]
+  (replace* :all s match repla))
+
+(defn replace-first
+  [s match repla]
+  (replace* :first s match repla))
+
+(defn join
+  "Returns a string of all elements in coll, as returned by (seq coll),
+   separated by an optional separator."
+  ([coll]
+     (apply str coll))
+  ([separator coll]
+   (apply str (interpose separator coll))))
+
+(def upper-case (perl-eval "sub{my$s=shift;die q(Nil) unless defined($s);CORE::uc(clojure::core::str($s))}"))
+(def lower-case (perl-eval "sub{my$s=shift;die q(Nil) unless defined($s);CORE::lc(clojure::core::str($s))}"))
+
+(defn capitalize
+  [s]
+  (let [s (str s)]
+    (if (< (count s) 2)
+      (upper-case s)
+      (str (upper-case (subs s 0 1))
+           (lower-case (subs s 1))))))
+
+(def split
+  (let [split* 
+        (perl-eval "sub{my$s=shift;my$re=shift;if(@_){my$limit=shift;+[CORE::split($re,$s,$limit)]}else{+[CORE::split($re,$s)]}}")]
+    (fn [ & args ]
+      (vec (apply split* args)))))
+
+(defn split-lines
+  "Splits s on \\n or \\r\\n. Trailing empty lines are not returned."
+  [s]
+  (split s #"\r?\n"))
+
+(defn triml
+  [s]
+  (replace s #"^\s*" ""))
+
+(defn trimr
+  [s]
+  (replace s #"\s*$" ""))
+
+(defn trim
+  "Removes whitespace from both ends of string."
+  [s]
+  (-> s triml trimr))
+
+(defn trim-newline
+  "Removes all trailing newline \\n or return \\r characters from
+  string.  Similar to Perl's chomp."
+  [s]
+  (replace s #"[\r\n]*$" ""))
+
+(defn blank?
+  "True if s is nil, empty, or contains only whitespace."
+  [s]
+  (if s
+    (boolean (re-matches #"\p{White_Space}*" s))
+    true))
+
+(defn escape
+  [s cmap]
+  (loop [index (int 0)
+         buffer ""]
+    (if (= (count s) index)
+      buffer
+      (let [ch (nth s index)
+            addition (if-let [replacement (cmap ch)]
+                       replacement
+                       ch)]
+        (recur (inc index) (str buffer addition))))))
+
+; index(STR,SUBSTR,POSITION)# Returns -1 (not found)
+
+(def index-of
+  (let [index* (perl-eval "sub{my$big=shift;my$small=shift;if(@_){my$p=shift;CORE::index($big,$small,$p)}else{CORE::index($big,$small)}}")]
+    (fn [& args ]
+      (let [ret (apply index* args)]
+        (when (not= -1 ret)
+          ret)))))
+
+(def last-index-of
+  (let [rindex* (perl-eval "sub{my$big=shift;my$small=shift;if(@_){my$p=shift;CORE::rindex($big,$small,$p)}else{CORE::rindex($big,$small)}}")]
+    (fn [& args ]
+      (let [ret (apply rindex* args)]
+        (when (not= -1 ret)
+          ret)))))
+
+(defn starts-with?
+  [s substr]
+  (and (>= (count s) (count substr))
+       (= substr (subs s 0 (count substr)))))
+
+(defn ends-with?
+  [s substr]
+  (and (>= (count s) (count substr))
+       (= substr (subs s (- (count s) (count substr))))))
+
+(defn includes?
+  [s substr]
+  (boolean (index-of s substr)))
